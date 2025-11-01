@@ -55,15 +55,6 @@ class Controller:
         # NEW: Lazy Element0 proxy for AppKeySend etc.
         self.elem_proxy = None
 
-        def _get_elem_proxy(self):
-            if self.elem_proxy is not None:
-                return self.elem_proxy
-            if not self.node_path:
-                raise RuntimeError("Not attached yet")
-            elem_path = f"{self.node_path}/element0"  # Standard BlueZ Element1 path
-            self.elem_proxy = self.bus.get(MESH_BUS, elem_path)
-            return self.elem_proxy
-
         # GUI callbacks for logging + scan table
         self._log_cb: Callable[[str], None] = lambda s: print(s)
         self._scan_cb: Callable[[str, int], None] = lambda uuid_hex, rssi: None
@@ -115,6 +106,7 @@ class Controller:
             (LOG_DIR / "mesh_devkey.log").touch(exist_ok=True)
         except Exception:
             pass
+
     # ---------------- internal helpers ----------------
 
     def _get_mesh(self):
@@ -544,6 +536,22 @@ class Controller:
             ),
             label
         )
+
+    def _bind_local_client_sig(self, local_elem_addr: int, app_index: int, model_id: int):
+        """
+        Bind a SIG client model on *our local node* (the provisioner) to AppKey.
+        This uses the mgmt.Bind D-Bus method (no DevKey).
+        """
+        def do():
+            # dest_unicast for ourselves is our primary address; that’s 0x0001 in your setup.
+            self.mgmt.Bind(
+                ELEM0_PATH,
+                int(0x0001),             # our own unicast (primary)
+                int(local_elem_addr),    # our element addr (primary)
+                int(app_index),
+                int(model_id)
+            )
+        return self._safe_call(do, "Bind(Local Client)")
 
     def _encode_model_app_bind(self, elem_addr: int, app_index: int, model_id: int) -> bytes:
         """
@@ -1000,6 +1008,19 @@ class Controller:
         def _kickoff_cfg():
             # Ensure we have AppKey(0) locally
             self._ensure_appkey(app_index=0, net_index=0)
+            
+            # Bind our LOCAL Generic OnOff Client (0x1001) to AppKey(0)
+            # on our provisioner node (primary element typically 0x0001).
+            ok_bind_local, msg_bind_local = self._bind_local_client_sig(
+                local_elem_addr=0x0001,  # provisioner primary elem
+                app_index=0,
+                model_id=0x1001          # Generic OnOff Client
+            )
+            if ok_bind_local:
+                self.log(f"[FSM] Local Client Bind OK: {msg_bind_local}")
+            else:
+                self.log(f"[FSM] Local Client Bind FAILED: {msg_bind_local} (Sends may fail)")
+
 
             # Push that AppKey down to the node (Config AppKey Add)
             ok, msg = self.add_appkey_to_node(
@@ -1106,9 +1127,8 @@ class Controller:
 
         # FIXED: Use Element0 proxy + explicit path
         try:
-            elem = self._get_elem_proxy()
             return self._safe_call(
-                lambda: elem.AppKeySend(
+                lambda: self.mgmt.Send(
                     ELEM0_PATH,  # Our app's Element0 path
                     int(dest_unicast),
                     int(app_idx),
