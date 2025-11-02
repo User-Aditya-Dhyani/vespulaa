@@ -55,15 +55,6 @@ class Controller:
         # NEW: Lazy Element0 proxy for AppKeySend etc.
         self.elem_proxy = None
 
-        def _get_elem_proxy(self):
-            if self.elem_proxy is not None:
-                return self.elem_proxy
-            if not self.node_path:
-                raise RuntimeError("Not attached yet")
-            elem_path = f"{self.node_path}/element0"  # Standard BlueZ Element1 path
-            self.elem_proxy = self.bus.get(MESH_BUS, elem_path)
-            return self.elem_proxy
-
         # GUI callbacks for logging + scan table
         self._log_cb: Callable[[str], None] = lambda s: print(s)
         self._scan_cb: Callable[[str, int], None] = lambda uuid_hex, rssi: None
@@ -115,6 +106,7 @@ class Controller:
             (LOG_DIR / "mesh_devkey.log").touch(exist_ok=True)
         except Exception:
             pass
+
     # ---------------- internal helpers ----------------
 
     def _get_mesh(self):
@@ -367,6 +359,40 @@ class Controller:
             self._attach_in_progress = False
         return ok, msg
 
+    def config_local_client(self) -> tuple[bool, str]:
+        """
+        One-time setup: Add AppKey(0) + Bind to local Generic OnOff Client (0x1001) on primary elem.
+        Idempotent: Skips if already in nodes.json as 'local_provisioner'.
+        """
+
+        self._ensure_appkey(app_index=0, net_index=0)
+
+        local_unicast = 0x0001  # Or self.get_local_unicast() if added
+        local_elem = 0x0001
+        app_idx = 0
+        model_id = 0x1001
+
+        # Check if done (persist flag in nodes.json)
+        db = load_nodes_db()
+        if db.get("local_provisioner", {}).get("appkey_bound", False):
+            return True, "Local client already configured (skipped)"
+
+        self.log(f"[LocalConfig] Adding AppKey({app_idx}) to local node 0x{local_unicast:04x}")
+        ok_add, msg_add = self.add_appkey_to_node(local_unicast, app_index=app_idx, net_index=0, update=False)
+        if not ok_add:
+            return False, f"Local AppKey add FAILED: {msg_add}"
+
+        self.log(f"[LocalConfig] Binding local Client (0x{model_id:04x}) to AppKey({app_idx})")
+        ok_bind, msg_bind = self.cfg_bind_model_sig(local_unicast, local_elem, app_idx, model_id)
+        if not ok_bind:
+            return False, f"Local Bind FAILED: {msg_bind}"
+
+        # Flag as done in nodes.json
+        db["local_provisioner"] = {"appkey_bound": True, "configured_at": datetime.now(timezone.utc).isoformat()}
+        save_nodes_db(db)
+        self.log("[LocalConfig] Local client configured! OnOff Sends now work.")
+        return True, "Local client configured successfully"
+
     def detach_local(self):
         """
         Local-only detach: drop mgmt proxy but don't tell daemon to forget us.
@@ -438,7 +464,15 @@ class Controller:
         # local cleanup
         try:
             clear_token()
-            from .util import NODE_UUID_FILE
+            from .util import NODE_UUID_FILE, NODES_FILE
+            try:
+                NODES_FILE.unlink(missing_ok=True)
+            except TypeError:
+                import os
+                try:
+                    os.remove(NODES_FILE)
+                except Exception:
+                    pass
             try:
                 NODE_UUID_FILE.unlink(missing_ok=True)
             except TypeError:
@@ -544,6 +578,16 @@ class Controller:
             ),
             label
         )
+
+    def _bind_local_client_sig(self, local_elem_addr: int, app_index: int, model_id: int):
+        # Bind LOCAL Generic OnOff Client (0x1001) to AppKey(0) on local primary elem 0x0001
+        local_unicast = 0x0001  # Provisioner primary; query if needed via get_local_unicast()
+        try:
+            # Positional: target=local_unicast, elem_addr, app_index, model_id
+            ok, msg = self.cfg_bind_model_sig(local_unicast, local_elem_addr, app_index, model_id)
+            return ok, msg
+        except Exception as e:
+            return False, f"Local bind exception: {e}"
 
     def _encode_model_app_bind(self, elem_addr: int, app_index: int, model_id: int) -> bytes:
         """
@@ -1106,9 +1150,8 @@ class Controller:
 
         # FIXED: Use Element0 proxy + explicit path
         try:
-            elem = self._get_elem_proxy()
             return self._safe_call(
-                lambda: elem.AppKeySend(
+                lambda: self.mgmt.Send(
                     ELEM0_PATH,  # Our app's Element0 path
                     int(dest_unicast),
                     int(app_idx),
@@ -1139,4 +1182,3 @@ class Controller:
     @property
     def is_attached(self) -> bool:
         return self.node_path is not None and self.mgmt is not None
-
