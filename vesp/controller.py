@@ -430,7 +430,15 @@ class Controller:
         # local cleanup
         try:
             clear_token()
-            from .util import NODE_UUID_FILE
+            from .util import NODE_UUID_FILE, NODES_FILE
+            try:
+                NODES_FILE.unlink(missing_ok=True)
+            except TypeError:
+                import os
+                try:
+                    os.remove(NODES_FILE)
+                except Exception:
+                    pass
             try:
                 NODE_UUID_FILE.unlink(missing_ok=True)
             except TypeError:
@@ -538,20 +546,14 @@ class Controller:
         )
 
     def _bind_local_client_sig(self, local_elem_addr: int, app_index: int, model_id: int):
-        """
-        Bind a SIG client model on *our local node* (the provisioner) to AppKey.
-        This uses the mgmt.Bind D-Bus method (no DevKey).
-        """
-        def do():
-            # dest_unicast for ourselves is our primary address; that’s 0x0001 in your setup.
-            self.mgmt.Bind(
-                ELEM0_PATH,
-                int(0x0001),             # our own unicast (primary)
-                int(local_elem_addr),    # our element addr (primary)
-                int(app_index),
-                int(model_id)
-            )
-        return self._safe_call(do, "Bind(Local Client)")
+        # Bind LOCAL Generic OnOff Client (0x1001) to AppKey(0) on local primary elem 0x0001
+        local_unicast = 0x0001  # Provisioner primary; query if needed via get_local_unicast()
+        try:
+            # Positional: target=local_unicast, elem_addr, app_index, model_id
+            ok, msg = self.cfg_bind_model_sig(local_unicast, local_elem_addr, app_index, model_id)
+            return ok, msg
+        except Exception as e:
+            return False, f"Local bind exception: {e}"
 
     def _encode_model_app_bind(self, elem_addr: int, app_index: int, model_id: int) -> bytes:
         """
@@ -1008,6 +1010,19 @@ class Controller:
         def _kickoff_cfg():
             # Ensure we have AppKey(0) locally
             self._ensure_appkey(app_index=0, net_index=0)
+
+            # NEW: Add AppKey(0) to LOCAL node first (self-targeted, idempotent update=True)
+            local_unicast = 0x0001  # Or self.get_local_unicast() if you added that
+            self.log(f"[FSM] Adding AppKey(0) to local node 0x{local_unicast:04x}")
+            ok_add_local, msg_add_local = self.add_appkey_to_node(
+                local_unicast, app_index=0, net_index=0, update=False  # update=True for idempotency
+            )
+            if ok_add_local:
+                self.log(f"[FSM] Local AppKey Add OK: {msg_add_local}")
+                # Expect DevKey: AppKeyStatus status=0x00 from src=0x0001 remote=False
+            else:
+                self.log(f"[FSM] Local AppKey Add FAILED: {msg_add_local} (Binding will fail)")
+                return  # Bail early if needed
             
             # Bind our LOCAL Generic OnOff Client (0x1001) to AppKey(0)
             # on our provisioner node (primary element typically 0x0001).
@@ -1159,4 +1174,3 @@ class Controller:
     @property
     def is_attached(self) -> bool:
         return self.node_path is not None and self.mgmt is not None
-

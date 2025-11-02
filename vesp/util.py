@@ -16,6 +16,7 @@ LOG_DIR = STATE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 NODE_UUID_FILE = STATE_DIR / "node_uuid.json"
+NODES_FILE = STATE_DIR / "nodes.json"
 
 CONFIG_DIR = STATE_DIR
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
