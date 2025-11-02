@@ -48,8 +48,9 @@ class VespGUI:
         self.btn_detach = ttk.Button(row0, text="Detach (local)", command=self._do_detach)
         self.btn_leave  = ttk.Button(row0, text="Leave…", command=self._do_leave)
         self.btn_purge  = ttk.Button(row0, text="Purge (deep)", command=self._do_purge)
+        self.btn_local_config = ttk.Button(row0, text="Config Local Client", command=self._do_local_config)
 
-        for w in (self.btn_create, self.btn_attach, self.btn_detach, self.btn_leave, self.btn_purge):
+        for w in (self.btn_create, self.btn_attach, self.btn_detach, self.btn_leave, self.btn_purge, self.btn_local_config):
             w.pack(side="left", padx=(0, 6))
 
         # Row 1: Scan controls
@@ -89,41 +90,7 @@ class VespGUI:
         self.btn_prov_uuid = ttk.Button(actions, text="Provision UUID", command=self._do_provision_uuid)
         self.btn_prov_uuid.pack(side="left", padx=(0, 6))
 
-        # Row 3: Config actions (AppKey/Bind/Subscribe)
-        cfg = ttk.LabelFrame(outer, text="Config Actions (local/remote)")
-        cfg.pack(fill="x", pady=(4, 8), padx=2)
-
-        row = 0
-        ttk.Label(cfg, text="Target Unicast (hex)").grid(row=row, column=0, sticky="w", padx=6, pady=4)
-        self.ent_target = ttk.Entry(cfg, width=10)
-        self.ent_target.insert(0, "0001")
-        self.ent_target.grid(row=row, column=1, sticky="w", padx=6, pady=4)
-
-        ttk.Label(cfg, text="Element Addr (hex)").grid(row=row, column=2, sticky="w", padx=6, pady=4)
-        self.ent_elem = ttk.Entry(cfg, width=10)
-        self.ent_elem.insert(0, "0001")
-        self.ent_elem.grid(row=row, column=3, sticky="w", padx=6, pady=4)
-
-        row += 1
-        ttk.Label(cfg, text="SIG Model ID (hex)").grid(row=row, column=0, sticky="w", padx=6, pady=4)
-        self.ent_model = ttk.Entry(cfg, width=10)
-        self.ent_model.insert(0, "1001")  # Generic OnOff Client
-        self.ent_model.grid(row=row, column=1, sticky="w", padx=6, pady=4)
-
-        ttk.Label(cfg, text="Group Addr (hex)").grid(row=row, column=2, sticky="w", padx=6, pady=4)
-        self.ent_group = ttk.Entry(cfg, width=10)
-        self.ent_group.insert(0, "C001")
-        self.ent_group.grid(row=row, column=3, sticky="w", padx=6, pady=4)
-
-        row += 1
-        btns = ttk.Frame(cfg)
-        btns.grid(row=row, column=0, columnspan=4, sticky="w", padx=6, pady=6)
-
-        ttk.Button(btns, text="Create AppKey(0)", command=lambda: self._do_threaded(self.ctrl.ensure_appkey, "CreateAppKey")).pack(side="left", padx=4)
-        ttk.Button(btns, text="Bind Model to AppKey(0)", command=self._do_bind).pack(side="left", padx=4)
-        ttk.Button(btns, text="Subscribe Model to Group", command=self._do_sub).pack(side="left", padx=4)
-
-        # Row 4: Node Reset
+        # Row 3: Node Reset
         row3 = ttk.Frame(outer)
         row3.pack(fill="x", pady=(8, 8))
         ttk.Label(row3, text="Node Reset unicast:").pack(side="left")
@@ -132,7 +99,7 @@ class VespGUI:
         self.ent_unicast.pack(side="left", padx=(4, 6))
         ttk.Button(row3, text="Reset", command=self._do_reset).pack(side="left")
 
-        # Row 5: Log pane
+        # Row 4: Log pane
         row4 = ttk.Frame(outer)
         row4.pack(fill="both", expand=True)
 
@@ -215,6 +182,12 @@ class VespGUI:
     def _do_attach(self):  self._do_threaded(self.ctrl.attach, "Attach")
     def _do_detach(self):  self._do_threaded(self.ctrl.detach_local, "Detach")
     def _do_purge(self):   self._do_threaded(self.ctrl.purge_local_node, "Purge")
+
+    def _do_local_config(self):
+        if not self.ctrl.is_attached:
+            messagebox.showwarning("Local Config", "Attach to network first.")
+            return
+        self._do_threaded(lambda: self.ctrl.config_local_client(), "LocalConfig")
 
     def _do_leave(self):
         if not messagebox.askyesno("Confirm Leave",
