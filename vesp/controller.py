@@ -359,6 +359,40 @@ class Controller:
             self._attach_in_progress = False
         return ok, msg
 
+    def config_local_client(self) -> tuple[bool, str]:
+        """
+        One-time setup: Add AppKey(0) + Bind to local Generic OnOff Client (0x1001) on primary elem.
+        Idempotent: Skips if already in nodes.json as 'local_provisioner'.
+        """
+
+        self._ensure_appkey(app_index=0, net_index=0)
+
+        local_unicast = 0x0001  # Or self.get_local_unicast() if added
+        local_elem = 0x0001
+        app_idx = 0
+        model_id = 0x1001
+
+        # Check if done (persist flag in nodes.json)
+        db = load_nodes_db()
+        if db.get("local_provisioner", {}).get("appkey_bound", False):
+            return True, "Local client already configured (skipped)"
+
+        self.log(f"[LocalConfig] Adding AppKey({app_idx}) to local node 0x{local_unicast:04x}")
+        ok_add, msg_add = self.add_appkey_to_node(local_unicast, app_index=app_idx, net_index=0, update=False)
+        if not ok_add:
+            return False, f"Local AppKey add FAILED: {msg_add}"
+
+        self.log(f"[LocalConfig] Binding local Client (0x{model_id:04x}) to AppKey({app_idx})")
+        ok_bind, msg_bind = self.cfg_bind_model_sig(local_unicast, local_elem, app_idx, model_id)
+        if not ok_bind:
+            return False, f"Local Bind FAILED: {msg_bind}"
+
+        # Flag as done in nodes.json
+        db["local_provisioner"] = {"appkey_bound": True, "configured_at": datetime.now(timezone.utc).isoformat()}
+        save_nodes_db(db)
+        self.log("[LocalConfig] Local client configured! OnOff Sends now work.")
+        return True, "Local client configured successfully"
+
     def detach_local(self):
         """
         Local-only detach: drop mgmt proxy but don't tell daemon to forget us.
@@ -1010,32 +1044,6 @@ class Controller:
         def _kickoff_cfg():
             # Ensure we have AppKey(0) locally
             self._ensure_appkey(app_index=0, net_index=0)
-
-            # NEW: Add AppKey(0) to LOCAL node first (self-targeted, idempotent update=True)
-            local_unicast = 0x0001  # Or self.get_local_unicast() if you added that
-            self.log(f"[FSM] Adding AppKey(0) to local node 0x{local_unicast:04x}")
-            ok_add_local, msg_add_local = self.add_appkey_to_node(
-                local_unicast, app_index=0, net_index=0, update=False  # update=True for idempotency
-            )
-            if ok_add_local:
-                self.log(f"[FSM] Local AppKey Add OK: {msg_add_local}")
-                # Expect DevKey: AppKeyStatus status=0x00 from src=0x0001 remote=False
-            else:
-                self.log(f"[FSM] Local AppKey Add FAILED: {msg_add_local} (Binding will fail)")
-                return  # Bail early if needed
-            
-            # Bind our LOCAL Generic OnOff Client (0x1001) to AppKey(0)
-            # on our provisioner node (primary element typically 0x0001).
-            ok_bind_local, msg_bind_local = self._bind_local_client_sig(
-                local_elem_addr=0x0001,  # provisioner primary elem
-                app_index=0,
-                model_id=0x1001          # Generic OnOff Client
-            )
-            if ok_bind_local:
-                self.log(f"[FSM] Local Client Bind OK: {msg_bind_local}")
-            else:
-                self.log(f"[FSM] Local Client Bind FAILED: {msg_bind_local} (Sends may fail)")
-
 
             # Push that AppKey down to the node (Config AppKey Add)
             ok, msg = self.add_appkey_to_node(
