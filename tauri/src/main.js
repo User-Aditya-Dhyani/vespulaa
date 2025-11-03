@@ -106,6 +106,7 @@ function renderNodesDash() {
       const row = document.createElement("div");
       row.className = "nodes-row";
 
+      // ---- Name (inline editable) ----
       const nameCol = document.createElement("div");
       nameCol.className = "col name";
       const view = document.createElement("div");
@@ -142,27 +143,46 @@ function renderNodesDash() {
         edit.addEventListener("blur", commit);
       });
 
+      // ---- UUID ----
       const uuidCol = document.createElement("div");
       uuidCol.className = "col uuid";
       uuidCol.textContent = cleanUuid(uuid);
 
-      const rssiCol = document.createElement("div");
-      rssiCol.className = "col rssi";
-      const rssi = (info && typeof info === "object" && info.best_rssi != null) ? info.best_rssi : "";
-      rssiCol.textContent = String(rssi);
+      // ---- Unicast (from nodes.json) ----
+      const unicastCol = document.createElement("div");
+      unicastCol.className = "col unicast";
+      const unicast = (info && typeof info === "object" && info.unicast != null) ? String(info.unicast) : "";
+      unicastCol.textContent = unicast;
 
+      // ---- Actions: Reset using row's unicast ----
       const actionsCol = document.createElement("div");
       actionsCol.className = "col actions";
-      const btnMsg = document.createElement("button");
-      btnMsg.className = "btn"; btnMsg.textContent = "Message"; btnMsg.title = "Future: send model cmd";
-      btnMsg.addEventListener("click", () => { push("app", `[UI] (future) send message → ${getNodeName(uuid)}`); });
-      actionsCol.appendChild(btnMsg);
+      const btnReset = document.createElement("button");
+      btnReset.className = "btn warn";
+      btnReset.textContent = "Reset";
+      btnReset.title = "Reset this node via its unicast from nodes.json";
+      if (!unicast) {
+        btnReset.disabled = true;
+        btnReset.title = "No unicast in nodes.json for this node";
+      }
+      btnReset.addEventListener("click", () => {
+        if (!unicast) {
+          push("app", `[UI] reset_node: missing unicast for ${getNodeName(uuid)}`);
+          return;
+        }
+        push("app", `[UI] reset_node → ${getNodeName(uuid)} (${unicast})`);
+        send("reset_node", { unicast });
+      });
+      actionsCol.appendChild(btnReset);
 
-      row.appendChild(nameCol); row.appendChild(uuidCol); row.appendChild(rssiCol); row.appendChild(actionsCol);
+      row.appendChild(nameCol);
+      row.appendChild(uuidCol);
+      row.appendChild(unicastCol);
+      row.appendChild(actionsCol);
       body.appendChild(row);
     }
   } else {
-    // Fallback: legacy “scan-only” rows
+    // Fallback: legacy “scan-only” rows (kept intact)
     const entries = [...scanMap.entries()].sort((a,b)=> b[1]-a[1]);
     for (const [uuid, rssi] of entries) {
       const row = document.createElement("div");
@@ -205,15 +225,22 @@ function renderNodesDash() {
       });
 
       const uuidCol = document.createElement("div"); uuidCol.className = "col uuid"; uuidCol.textContent = cleanUuid(uuid);
-      const rssiCol = document.createElement("div"); rssiCol.className = "col rssi"; rssiCol.textContent = String(rssi);
 
-      const actionsCol = document.createElement("div"); actionsCol.className = "col actions";
-      const btnMsg = document.createElement("button");
-      btnMsg.className = "btn"; btnMsg.textContent = "Message"; btnMsg.title = "Future: send model cmd";
-      btnMsg.addEventListener("click", () => { push("app", `[UI] (future) send message → ${getNodeName(uuid)}`); });
-      actionsCol.appendChild(btnMsg);
+      // DB absent: show RSSI placeholder in the Unicast column
+      const unicastCol = document.createElement("div");
+      unicastCol.className = "col unicast";
+      unicastCol.textContent = `RSSI ${String(rssi)}`;
 
-      row.appendChild(nameCol); row.appendChild(uuidCol); row.appendChild(rssiCol); row.appendChild(actionsCol);
+      const actionsCol = document.createElement("div");
+      actionsCol.className = "col actions";
+      const btnReset = document.createElement("button");
+      btnReset.className = "btn warn";
+      btnReset.textContent = "Reset";
+      btnReset.disabled = true;
+      btnReset.title = "Unavailable (no nodes.json entry)";
+      actionsCol.appendChild(btnReset);
+
+      row.appendChild(nameCol); row.appendChild(uuidCol); row.appendChild(unicastCol); row.appendChild(actionsCol);
       body.appendChild(row);
     }
   }
@@ -260,6 +287,13 @@ function startApp() {
     el.addEventListener("scroll", () => { stickToBottom[tab] = nearBottom(el); });
     el.addEventListener("wheel",  () => { stickToBottom[tab] = nearBottom(el); }, { passive: true });
     el.addEventListener("mousedown", () => { stickToBottom[tab] = nearBottom(el); });
+  });
+
+  // Toggle the right-side scan panel (it shrinks layout via CSS grid)
+  const grid = $(".grid");
+  const scanToggle = $("#scanToggle");
+  scanToggle?.addEventListener("click", () => {
+    grid?.classList.toggle("scan-open");
   });
 
   const ul = $("#scanList");
@@ -313,6 +347,8 @@ function startApp() {
     const secs = parseInt($("#scanSecs")?.value || "15", 10);
     scanMap.clear();
     renderScanList();
+    // Auto-open the side scan panel when starting a scan
+    $(".grid")?.classList.add("scan-open");
     send("scan_start", { seconds: Number.isFinite(secs) ? secs : 15 });
   });
 
@@ -328,12 +364,6 @@ function startApp() {
     const uuid = getSelectedUuid();
     if (!uuid) return push("app", "[UI] provision_selected: nothing selected");
     send("provision_uuid", { uuid });
-  });
-
-  $("#resetBtn")?.addEventListener("click", () => {
-    const unicast = ($("#resetUnicast")?.value || "").trim();
-    if (!unicast) return push("app", "[UI] reset_node: no unicast");
-    send("reset_node", { unicast });
   });
 
   if (listen) {
@@ -389,7 +419,7 @@ function startApp() {
         const prev = scanMap.get(clean);
         if (prev === undefined || rssi > prev) scanMap.set(clean, rssi|0);
         renderScanList();
-        // Nodes tab is DB-driven; scan list is left-only.
+        // Nodes tab is DB-driven; scan list lives in the right-side panel.
       });
     })();
   } else {

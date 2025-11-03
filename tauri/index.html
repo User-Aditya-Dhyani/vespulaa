@@ -21,6 +21,7 @@
       <input id="scanSecs" value="15" size="3" class="in">
       <button class="btn" id="scanStart">Start</button>
       <button class="btn" id="scanStop">Stop</button>
+      <button class="btn" id="scanToggle" title="Toggle scan panel">Scan Panel</button>
     </div>
   </header>
 
@@ -29,25 +30,7 @@
   </div>
 
   <main class="grid">
-    <section class="leftcol card">
-      <h3>Unprovisioned (UUID | RSSI)</h3>
-      <ul id="scanList" class="list"></ul>
-      <div class="row">
-        <button class="btn" id="provSelected">Provision Selected</button>
-        <span class="grow"></span>
-        <label>UUID:</label>
-        <input id="provUuid" size="36" class="in">
-        <button class="btn" id="provUuidBtn">Provision UUID</button>
-      </div>
-
-      <h3>Node Reset</h3>
-      <div class="row">
-        <label>Unicast:</label>
-        <input id="resetUnicast" value="00aa" size="8" class="in">
-        <button class="btn warn" id="resetBtn">Reset</button>
-      </div>
-    </section>
-
+    <!-- Main content column -->
     <section class="rightcol card">
       <nav id="logTabs">
         <button class="tab" data-tab="nodes">Nodes</button>
@@ -59,7 +42,7 @@
         <div class="nodes-head">
           <div class="col name">Name</div>
           <div class="col uuid">UUID</div>
-          <div class="col rssi">Best RSSI</div>
+          <div class="col unicast">Unicast</div>
           <div class="col actions">Actions</div>
         </div>
         <div id="nodes-body" class="nodes-body"></div>
@@ -69,6 +52,19 @@
       <pre id="log-app" class="log hidden"></pre>
       <div class="status" id="status">Status: idle</div>
     </section>
+
+    <!-- Collapsible right-side scan panel column -->
+    <aside id="scanAside" class="card">
+      <h4>Unprovisioned (UUID | RSSI)</h4>
+      <ul id="scanList" class="list compact"></ul>
+      <div class="row" style="margin-top:8px;">
+        <button class="btn" id="provSelected">Provision Selected</button>
+        <span class="grow"></span>
+        <label>UUID:</label>
+        <input id="provUuid" size="36" class="in">
+        <button class="btn" id="provUuidBtn">Provision UUID</button>
+      </div>
+    </aside>
   </main>
 
   <!-- Robust loader: try both known Tauri v2 script locations.

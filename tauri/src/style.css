@@ -1,4 +1,3 @@
-/* tauri/src/style.css */
 :root {
   --bg: #0b0c0f;
   --panel: #12141a;
@@ -51,38 +50,61 @@ body {
   padding: 6px 8px; min-width: 0;
 }
 
+/* Two-column layout when scan panel is open; otherwise single column */
 .grid {
-  display: grid; grid-template-columns: 1fr 1.4fr;
+  display: grid; grid-template-columns: 1fr;
   gap: 14px; padding: 14px;
+  transition: grid-template-columns .18s ease;
 }
+.grid.scan-open {
+  grid-template-columns: 1fr 420px; /* right-side scan panel width */
+}
+
 .card {
   background: linear-gradient(180deg, #12141a, #0e1116);
   border: 1px solid var(--border); border-radius: var(--radius);
   padding: 12px; min-height: 70vh;
   box-shadow: 0 10px 30px #00000033 inset, 0 10px 30px #00000022;
 }
-.leftcol .row { display: flex; gap: 8px; align-items: center; margin: 8px 0 14px; }
-.leftcol .grow { flex: 1; }
 
-h3 { margin: 14px 0 8px; color: var(--muted); font-weight: 600; }
+/* Right-side scan panel (a real column, not overlay) */
+#scanAside.card {
+  min-height: 70vh;
+  display: flex;
+  flex-direction: column;
+}
+#scanAside h4 {
+  margin: 6px 0 10px;
+  color: var(--muted);
+  font-weight: 600;
+}
 .list {
   list-style: none; padding: 0; margin: 0 0 12px 0;
   border: 1px dashed var(--border); border-radius: 10px;
-  min-height: 160px; background: #0a0d14;
+  background: #0a0d14;
+}
+.list.compact {
+  min-height: 100px;   /* ~half the old height */
+  max-height: 28vh;
+  overflow: auto;
 }
 .list li {
   padding: 8px 10px; border-bottom: 1px dashed #1a2030;
   display: flex; align-items: center; gap: 8px;
 }
 .list li:last-child { border-bottom: none; }
-.list input[type="checkbox"] { transform: scale(1.1); }
+#scanList li.sel { background: rgba(0, 0, 0, .18); outline: 1px solid rgba(0, 0, 255, .6); }
+#scanList li { cursor: pointer; }
+
+.row { display: flex; gap: 8px; align-items: center; }
+.row .grow { flex: 1; }
 
 .tabs { display: flex; gap: 8px; }
 .tab {
   background: #0f1320; border: 1px solid var(--border);
   color: var(--muted); border-radius: 10px; padding: 6px 10px; cursor: pointer;
 }
-.tab.active { color: var(--text); border-color: var(--accent); }
+.tab.active { color: var(--text); border-color: var(--accent); outline: 2px solid #9cf; }
 
 .logpane {
   background: #0b0e14; border: 1px solid var(--border);
@@ -92,43 +114,18 @@ h3 { margin: 14px 0 8px; color: var(--muted); font-weight: 600; }
   box-shadow: inset 0 0 0 1px #00000022;
 }
 .hidden { display: none; }
-.tab.active { outline: 2px solid #9cf; }
 
-.statusbar {
-  margin-top: 10px; padding: 8px 10px; border: 1px solid var(--border);
-  border-radius: 10px; color: var(--muted);
-  background: linear-gradient(180deg, #10131a, #0d1016);
-}
-
-#scanList li.sel {
-  background: rgba(0, 0, 0, .18);
-  outline: 1px solid rgba(0, 0, 255, .6);
-}
-#scanList li { cursor: pointer; }
-
-/* ensure panes are scroll containers themselves */
-.log {
-  max-height: 52vh;   /* or whatever height you want for the pane */
-  overflow: auto;     /* critical: makes the <pre> its own scroll area */
-  padding: 8px;
-  border-radius: 8px;
-  background: #0f1115;
-  color: #e5e7eb;
-  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  white-space: pre-wrap; /* if you want soft-wrap; else keep 'pre' */
-}
-
-/* optional: ensure the main right column doesn't force page scrolling */
 .rightcol.card { display: flex; flex-direction: column; }
 #logTabs { margin-bottom: 8px; }
-.status { margin-top: 8px; }
+.status { margin-top: 8px; color: var(--muted); }
 
 .nodes { display: block; }
 .nodes.hidden { display: none; }
 
+/* Nodes grid: Name | UUID | Unicast | Actions */
 .nodes-head, .nodes-row {
   display: grid;
-  grid-template-columns: 1.2fr 2.2fr 0.6fr 0.8fr;
+  grid-template-columns: 1.2fr 2.2fr 0.8fr 0.8fr;
   gap: 8px;
   align-items: center;
   padding: 6px 8px;
@@ -146,8 +143,11 @@ h3 { margin: 14px 0 8px; color: var(--muted); font-weight: 600; }
 .nodes-row {
   border-bottom: 1px dashed rgba(255,255,255,.06);
 }
-.nodes-row .uuid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; opacity: .9; }
-.nodes-row .rssi { text-align: right; }
+.nodes-row .uuid,
+.nodes-row .unicast {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; opacity: .9;
+}
+.nodes-row .unicast { text-align: right; }
 .nodes-row .actions button { margin-left: 6px; }
 
 .name-view { cursor: text; padding: 4px 6px; border-radius: 6px; }
