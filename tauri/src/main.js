@@ -308,10 +308,14 @@ function startApp() {
     });
   });
 
+  // Clear the unprovisioned UUIDs list immediately when Scan Start is clicked
   $("#scanStart")?.addEventListener("click", () => {
     const secs = parseInt($("#scanSecs")?.value || "15", 10);
+    scanMap.clear();
+    renderScanList();
     send("scan_start", { seconds: Number.isFinite(secs) ? secs : 15 });
   });
+
   $("#scanStop")?.addEventListener("click", () => send("scan_stop"));
 
   $("#provUuidBtn")?.addEventListener("click", () => {
@@ -339,7 +343,7 @@ function startApp() {
       await listen("log:nodes",  (e) => push("app", String(e.payload)));
       await listen("log:devkey", (e) => push("devkey", String(e.payload)));
 
-      // Debounced one-shot refresh after state-changing commands
+      // Debounced one-shot refresh after *only* the relevant state-changing commands.
       let refreshTimer = null;
       function scheduleRefresh(delay = 150) {
         if (refreshTimer) clearTimeout(refreshTimer);
@@ -354,9 +358,18 @@ function startApp() {
         setStatus(`${cmd} → ${ok ? "ok" : "error"}`);
         push("app", `[${ok?"OK":"ERR"}] ${cmd}: ${msg}`);
 
-        if (ok && (cmd === "attach" || cmd === "create_network" || cmd === "provision_uuid" || cmd === "reset_node" || cmd === "config_local_client" || cmd === "leave" || cmd === "purge")) {
-          scheduleRefresh(150); // one refresh, not a loop
+        // Only these commands trigger an explicit refresh.
+        if (ok && (
+          cmd === "attach" ||
+          cmd === "create_network" ||
+          cmd === "provision_uuid" ||
+          cmd === "reset_node" ||
+          cmd === "config_local_client"
+        )) {
+          scheduleRefresh(150);
         }
+        // No explicit refresh for: purge / leave / detach / scan_stop.
+        // Any file-side changes will still be caught by the nodes:changed watcher.
       });
 
       // Refresh when the actual file on disk changes (emitted by Rust watcher)
