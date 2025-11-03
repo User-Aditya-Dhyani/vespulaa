@@ -17,20 +17,26 @@
       <button class="btn" data-cmd="config_local_client">Config Local Client</button>
     </div>
     <div class="right">
-      <span>Scan(s)</span>
-      <input id="scanSecs" value="15" size="3" class="in">
-      <button class="btn" id="scanStart">Start</button>
-      <button class="btn" id="scanStop">Stop</button>
-      <button class="btn" id="scanToggle" title="Toggle scan panel">Scan Panel</button>
+      <!-- Menu opens overlay with actions (e.g., open Scan Panel) -->
+      <button class="btn" id="menuBtn" title="Menu">☰</button>
     </div>
   </header>
+
+  <!-- Small overlay menu -->
+  <div id="quickMenu">
+    <div class="item" data-action="open-scan" title="Open the Scan Panel">
+      <span class="icon">🔍</span>
+      <span>Scan Panel</span>
+    </div>
+    <!-- Add more items here later if needed -->
+  </div>
 
   <div id="boot-marker" style="position:fixed;bottom:8px;right:12px;font:12px/1.2 monospace;opacity:.6">
     HTML loaded… waiting for JS
   </div>
 
-  <main class="grid">
-    <!-- Main content column -->
+  <main class="grid"><!-- default: scan panel hidden (via CSS) -->
+    <!-- Primary column -->
     <section class="rightcol card">
       <nav id="logTabs">
         <button class="tab" data-tab="nodes">Nodes</button>
@@ -53,8 +59,20 @@
       <div class="status" id="status">Status: idle</div>
     </section>
 
-    <!-- Collapsible right-side scan panel column -->
+    <!-- Right-side Scan Panel (hidden by default via CSS until .scan-open) -->
     <aside id="scanAside" class="card">
+      <div class="scan-topbar">
+        <h4>Scan &amp; Unprovisioned</h4>
+        <button id="scanClose" title="Close panel">✕</button>
+      </div>
+
+      <div class="row" style="margin-bottom:8px;">
+        <label>Seconds</label>
+        <input id="scanSecs" value="15" size="3" class="in">
+        <button class="btn" id="scanStart">Start</button>
+        <button class="btn" id="scanStop">Stop</button>
+      </div>
+
       <h4>Unprovisioned (UUID | RSSI)</h4>
       <ul id="scanList" class="list compact"></ul>
       <div class="row" style="margin-top:8px;">
@@ -67,8 +85,7 @@
     </aside>
   </main>
 
-  <!-- Robust loader: try both known Tauri v2 script locations.
-       main.js will wait/poll up to 5s for window.__TAURI__. -->
+  <!-- Tauri loader (v2 paths), app will poll -->
   <script>
     (function loadTauriShim(ready){
       function inject(src, cb){
@@ -81,10 +98,9 @@
         if (window.__TAURI__) return ready();
         inject("tauri.js", ready);
       });
-    })(function(){ /* shim attempted (ok if it 404s; app will poll) */ });
+    })(function(){ /* shim attempted */ });
   </script>
 
-  <!-- Your app (has its own bootstrap/polling) -->
   <script defer src="src/main.js"></script>
 </body>
 </html>

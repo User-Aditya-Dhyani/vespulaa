@@ -11,6 +11,7 @@ const scanMap = new Map(); // uuid -> best RSSI
 const nodeNames = new Map(); // uuid -> friendly name
 let nodesDb = {};            // full Python-maintained DB (uuid_hex -> object)
 
+// ---------- utils ----------
 function toBottom(el){ el.scrollTop = el.scrollHeight; }
 function nearBottom(el, pad=12){ return el.scrollHeight - el.clientHeight - el.scrollTop < pad; }
 
@@ -40,13 +41,39 @@ function getNodeName(uuid) {
   return nodeNames.get(u) || u;
 }
 
+// Normalize unicast to hex string suitable for reset_node
+function toHexUnicast(u) {
+  if (u == null) return "";
+  if (typeof u === "string") {
+    const s = u.trim().toLowerCase();
+    if (/^0x[0-9a-f]+$/.test(s)) return s.slice(2);
+    if (/^[0-9a-f]+$/.test(s)) return s;
+    if (/^\d+$/.test(s)) { // decimal string
+      const n = BigInt(s);
+      let hx = n.toString(16);
+      if (hx.length % 2) hx = "0" + hx;
+      if (hx.length < 4) hx = hx.padStart(4, "0");
+      return hx;
+    }
+    return "";
+  }
+  try {
+    const n = BigInt(u);
+    let hx = n.toString(16);
+    if (hx.length % 2) hx = "0" + hx;
+    if (hx.length < 4) hx = hx.padStart(4, "0");
+    return hx;
+  } catch {
+    return "";
+  }
+}
+
 async function refreshNodesDb() {
   const invoke = window.__VESPU_INVOKE__;
   try {
     const db = await invoke?.("read_nodes_db");
     if (db && typeof db === "object") {
       nodesDb = db;
-      // Refresh name cache from DB (entry.name if present)
       nodeNames.clear();
       for (const [uuid, entry] of Object.entries(nodesDb)) {
         const nm = (entry && typeof entry === "object" && entry.name) ? String(entry.name) : "";
@@ -67,10 +94,8 @@ async function saveNodeName(uuid, name) {
   const invoke = window.__VESPU_INVOKE__;
   try {
     await invoke?.("set_node_name", { uuid: u, name: String(name) });
-    // Update UI cache immediately
     if (String(name).trim()) nodeNames.set(u, String(name).trim());
     else nodeNames.delete(u);
-    // Also update our nodesDb mirror so re-render shows it
     if (!nodesDb[u] || typeof nodesDb[u] !== "object") nodesDb[u] = {};
     nodesDb[u].name = String(name);
   } catch (e) {
@@ -146,34 +171,47 @@ function renderNodesDash() {
       // ---- UUID ----
       const uuidCol = document.createElement("div");
       uuidCol.className = "col uuid";
-      uuidCol.textContent = cleanUuid(uuid);
+      const uuidClean = cleanUuid(uuid);
+      uuidCol.textContent = uuidClean;
 
       // ---- Unicast (from nodes.json) ----
       const unicastCol = document.createElement("div");
       unicastCol.className = "col unicast";
-      const unicast = (info && typeof info === "object" && info.unicast != null) ? String(info.unicast) : "";
-      unicastCol.textContent = unicast;
+
+      const isLocal = uuidClean === "cae";
+      let rawUnicast = (info && typeof info === "object" && info.unicast != null) ? info.unicast : "";
+      let unicastHex = toHexUnicast(rawUnicast);
+      if (isLocal) unicastHex = "0001"; // rule: local 'cae' always 0001
+      unicastCol.textContent = unicastHex;
 
       // ---- Actions: Reset using row's unicast ----
       const actionsCol = document.createElement("div");
       actionsCol.className = "col actions";
-      const btnReset = document.createElement("button");
-      btnReset.className = "btn warn";
-      btnReset.textContent = "Reset";
-      btnReset.title = "Reset this node via its unicast from nodes.json";
-      if (!unicast) {
-        btnReset.disabled = true;
-        btnReset.title = "No unicast in nodes.json for this node";
-      }
-      btnReset.addEventListener("click", () => {
-        if (!unicast) {
-          push("app", `[UI] reset_node: missing unicast for ${getNodeName(uuid)}`);
-          return;
+
+      if (!isLocal) {
+        const btnReset = document.createElement("button");
+        btnReset.className = "btn warn";
+        btnReset.textContent = "Reset";
+        btnReset.title = "Reset this node via unicast from nodes.json";
+        if (!unicastHex) {
+          btnReset.disabled = true;
+          btnReset.title = "No valid unicast in nodes.json for this node";
         }
-        push("app", `[UI] reset_node → ${getNodeName(uuid)} (${unicast})`);
-        send("reset_node", { unicast });
-      });
-      actionsCol.appendChild(btnReset);
+        btnReset.addEventListener("click", () => {
+          if (!unicastHex) {
+            push("app", `[UI] reset_node: missing/invalid unicast for ${getNodeName(uuid)}`);
+            return;
+          }
+          push("app", `[UI] reset_node → ${getNodeName(uuid)} (${unicastHex})`);
+          send("reset_node", { unicast: unicastHex });
+        });
+        actionsCol.appendChild(btnReset);
+      } else {
+        const dot = document.createElement("span");
+        dot.textContent = "—";
+        dot.style.opacity = "0.6";
+        actionsCol.appendChild(dot);
+      }
 
       row.appendChild(nameCol);
       row.appendChild(uuidCol);
@@ -182,7 +220,7 @@ function renderNodesDash() {
       body.appendChild(row);
     }
   } else {
-    // Fallback: legacy “scan-only” rows (kept intact)
+    // Fallback: legacy “scan-only” rows
     const entries = [...scanMap.entries()].sort((a,b)=> b[1]-a[1]);
     for (const [uuid, rssi] of entries) {
       const row = document.createElement("div");
@@ -226,7 +264,6 @@ function renderNodesDash() {
 
       const uuidCol = document.createElement("div"); uuidCol.className = "col uuid"; uuidCol.textContent = cleanUuid(uuid);
 
-      // DB absent: show RSSI placeholder in the Unicast column
       const unicastCol = document.createElement("div");
       unicastCol.className = "col unicast";
       unicastCol.textContent = `RSSI ${String(rssi)}`;
@@ -262,7 +299,6 @@ function getSelectedUuid() {
 }
 
 async function bootAndRender() {
-  // pull nodes.json first, so Nodes tab is filled even before any scan
   await refreshNodesDb();
   renderNodesDash();
 }
@@ -276,12 +312,8 @@ function startApp() {
   panes.devkey = $("#log-devkey");
   panes.app   = $("#log-app");
 
-  push("app", "[UI] Frontend ready");
-  setStatus("idle");
-  setTab("nodes"); // show Nodes by default since we now have DB rendering
-  bootAndRender();
-
-  Object.entries(panes).forEach(([tab, el]) => {
+  // set terminal-style stickiness on log panes
+  Object.entries({devkey: panes.devkey, app: panes.app}).forEach(([tab, el]) => {
     if (!el) return;
     stickToBottom[tab] = true;
     el.addEventListener("scroll", () => { stickToBottom[tab] = nearBottom(el); });
@@ -289,13 +321,50 @@ function startApp() {
     el.addEventListener("mousedown", () => { stickToBottom[tab] = nearBottom(el); });
   });
 
-  // Toggle the right-side scan panel (it shrinks layout via CSS grid)
+  push("app", "[UI] Frontend ready");
+  setStatus("idle");
+  setTab("nodes");
+  bootAndRender();
+
+  // --- header quick-menu (overlay) ---
   const grid = $(".grid");
-  const scanToggle = $("#scanToggle");
-  scanToggle?.addEventListener("click", () => {
-    grid?.classList.toggle("scan-open");
+  const menuBtn = $("#menuBtn");
+  const menu = $("#quickMenu");
+  function closeMenu(){ menu?.classList.remove("open"); }
+  function openScanPanel(){ grid?.classList.add("scan-open"); }
+  function closeScanPanel(){ grid?.classList.remove("scan-open"); }
+
+  menuBtn?.addEventListener("click", () => {
+    menu?.classList.toggle("open");
+  });
+  menu?.addEventListener("click", (e) => {
+    const act = e.target.closest("[data-action]")?.dataset.action;
+    if (!act) return;
+    if (act === "open-scan") {
+      openScanPanel();
+    }
+    closeMenu();
+  });
+  document.addEventListener("click", (e) => {
+    if (!menu || !menuBtn) return;
+    if (menu.contains(e.target) || menuBtn.contains(e.target)) return;
+    closeMenu();
   });
 
+  // --- Scan panel controls (panel has its own close button) ---
+  $("#scanClose")?.addEventListener("click", closeScanPanel);
+
+  $("#scanStart")?.addEventListener("click", () => {
+    const secs = parseInt($("#scanSecs")?.value || "15", 10);
+    scanMap.clear();
+    renderScanList();
+    openScanPanel(); // ensure visible
+    send("scan_start", { seconds: Number.isFinite(secs) ? secs : 15 });
+  });
+
+  $("#scanStop")?.addEventListener("click", () => send("scan_stop"));
+
+  // --- Scan list interactions ---
   const ul = $("#scanList");
   if (ul) {
     ul.addEventListener("click", (e) => {
@@ -327,11 +396,13 @@ function startApp() {
     });
   }
 
+  // --- Tabs ---
   $("#logTabs")?.addEventListener("click", (e) => {
     const tab = e.target.closest(".tab")?.dataset.tab;
     if (tab) setTab(tab);
   });
 
+  // --- Top passthrough buttons ---
   $all("button[data-cmd]").forEach(btn => {
     btn.addEventListener("click", () => {
       const name = btn.dataset.cmd;
@@ -342,18 +413,7 @@ function startApp() {
     });
   });
 
-  // Clear the unprovisioned UUIDs list immediately when Scan Start is clicked
-  $("#scanStart")?.addEventListener("click", () => {
-    const secs = parseInt($("#scanSecs")?.value || "15", 10);
-    scanMap.clear();
-    renderScanList();
-    // Auto-open the side scan panel when starting a scan
-    $(".grid")?.classList.add("scan-open");
-    send("scan_start", { seconds: Number.isFinite(secs) ? secs : 15 });
-  });
-
-  $("#scanStop")?.addEventListener("click", () => send("scan_stop"));
-
+  // --- Provision controls ---
   $("#provUuidBtn")?.addEventListener("click", () => {
     const uuid = ($("#provUuid")?.value || "").trim();
     if (!uuid) return push("app", "[UI] provision_uuid: no UUID");
@@ -366,6 +426,7 @@ function startApp() {
     send("provision_uuid", { uuid });
   });
 
+  // --- Events from backend ---
   if (listen) {
     (async () => {
       await listen("log:app",    (e) => push("app", String(e.payload)));
@@ -388,7 +449,6 @@ function startApp() {
         setStatus(`${cmd} → ${ok ? "ok" : "error"}`);
         push("app", `[${ok?"OK":"ERR"}] ${cmd}: ${msg}`);
 
-        // Only these commands trigger an explicit refresh.
         if (ok && (
           cmd === "attach" ||
           cmd === "create_network" ||
@@ -398,11 +458,8 @@ function startApp() {
         )) {
           scheduleRefresh(150);
         }
-        // No explicit refresh for: purge / leave / detach / scan_stop.
-        // Any file-side changes will still be caught by the nodes:changed watcher.
       });
 
-      // Refresh when the actual file on disk changes (emitted by Rust watcher)
       await listen("nodes:changed", async () => {
         await refreshNodesDb();
         renderNodesDash();
@@ -419,7 +476,6 @@ function startApp() {
         const prev = scanMap.get(clean);
         if (prev === undefined || rssi > prev) scanMap.set(clean, rssi|0);
         renderScanList();
-        // Nodes tab is DB-driven; scan list lives in the right-side panel.
       });
     })();
   } else {
@@ -440,7 +496,7 @@ function startApp() {
       setTimeout(poll, 20);
     } else {
       console.error("[FATAL] Tauri globals not ready; UI will show 'invoke missing'.");
-      startApp(); // still start so you see logs/warnings
+      startApp();
     }
   })();
 })();
