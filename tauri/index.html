@@ -1,0 +1,67 @@
+<!-- tauri/index.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Vespulaa Mesh (ADV-only)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="./src/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="left">
+      <button class="btn" data-cmd="create_network">Create Network</button>
+      <button class="btn" data-cmd="attach">Attach</button>
+      <button class="btn" data-cmd="detach">Detach</button>
+      <button class="btn warn" data-cmd="leave">Leave…</button>
+      <button class="btn danger" data-cmd="purge">Purge (deep)</button>
+      <button class="btn" data-cmd="config_local_client">Config Local Client</button>
+    </div>
+    <div class="right">
+      <span>Scan(s)</span>
+      <input id="scanSecs" value="15" size="3" class="in">
+      <button class="btn" id="scanStart">Start</button>
+      <button class="btn" id="scanStop">Stop</button>
+    </div>
+  </header>
+  <div id="boot-marker" style="position:fixed;bottom:8px;right:12px;font:12px/1.2 monospace;opacity:.6">
+    HTML loaded… waiting for JS
+  </div>
+  <main class="grid">
+    <section class="leftcol card">
+      <h3>Unprovisioned (UUID | RSSI)</h3>
+      <ul id="scanList" class="list"></ul>
+      <div class="row">
+        <button class="btn" id="provSelected">Provision Selected</button>
+        <span class="grow"></span>
+        <label>UUID:</label>
+        <input id="provUuid" size="36" class="in">
+        <button class="btn" id="provUuidBtn">Provision UUID</button>
+      </div>
+
+      <h3>Node Reset</h3>
+      <div class="row">
+        <label>Unicast:</label>
+        <input id="resetUnicast" value="00aa" size="8" class="in">
+        <button class="btn warn" id="resetBtn">Reset</button>
+      </div>
+    </section>
+
+    <section class="rightcol card">
+      <nav id="logTabs">
+        <button class="tab" data-tab="nodes">Nodes</button>
+        <button class="tab" data-tab="devkey">DevKey</button>
+        <button class="tab" data-tab="app">App</button>
+      </nav>
+      <pre id="log-nodes" class="log"></pre>
+      <pre id="log-devkey" class="log hidden"></pre>
+      <pre id="log-app" class="log hidden"></pre>
+      <div class="status" id="status">Status: idle</div>
+
+    </section>
+  </main>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
+
