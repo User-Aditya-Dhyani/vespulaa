@@ -106,3 +106,20 @@ h3 { margin: 14px 0 8px; color: var(--muted); font-weight: 600; }
 }
 #scanList li { cursor: pointer; }
 
+/* ensure panes are scroll containers themselves */
+.log {
+  max-height: 52vh;   /* or whatever height you want for the pane */
+  overflow: auto;     /* critical: makes the <pre> its own scroll area */
+  padding: 8px;
+  border-radius: 8px;
+  background: #0f1115;
+  color: #e5e7eb;
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap; /* if you want soft-wrap; else keep 'pre' */
+}
+
+/* optional: ensure the main right column doesn't force page scrolling */
+.rightcol.card { display: flex; flex-direction: column; }
+#logTabs { margin-bottom: 8px; }
+.status { margin-top: 8px; }
+

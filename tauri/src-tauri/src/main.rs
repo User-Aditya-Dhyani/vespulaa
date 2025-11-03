@@ -3,7 +3,6 @@
 use serde::Deserialize;
 use std::{
   io::{BufRead, BufReader, Write},
-  process::{Command, Stdio},
   sync::{Arc, Mutex},
 };
 
@@ -183,6 +182,49 @@ fn spawn_python(handle: tauri::AppHandle) -> Result<PyProc, Box<dyn std::error::
   Ok(PyProc { stdin })
 }
 
+use std::{fs::File, io::{Seek, SeekFrom}, path::PathBuf, time::Duration};
+
+fn tail_file_to_event(handle: tauri::AppHandle, path: PathBuf, event: &'static str, read_last_kb: u64) {
+  std::thread::spawn(move || {
+    // Try to open; if missing, keep retrying silently every 1s
+    loop {
+      match File::open(&path) {
+        Ok(mut f) => {
+          let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+          if len > read_last_kb * 1024 {
+            let _ = f.seek(SeekFrom::End(-((read_last_kb * 1024) as i64)));
+          } else {
+            let _ = f.seek(SeekFrom::Start(0));
+          }
+
+          let mut reader = BufReader::new(f);
+          let mut buf = String::new();
+
+          // read existing tail immediately
+          loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+              Ok(0) => break,      // EOF
+              Ok(_) => { let _ = handle.emit(event, buf.trim_end().to_owned()); }
+              Err(_) => break,
+            }
+          }
+
+          // now watch for new lines by polling file size
+          loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+              Ok(0) => { std::thread::sleep(Duration::from_millis(400)); }
+              Ok(_) => { let _ = handle.emit(event, buf.trim_end().to_owned()); }
+              Err(_) => { std::thread::sleep(Duration::from_secs(1)); break; }
+            }
+          }
+        }
+        Err(_) => std::thread::sleep(Duration::from_secs(1)),
+      }
+    }
+  });
+}
 
 fn main() {
   tauri::Builder::default()
@@ -190,6 +232,17 @@ fn main() {
       let handle = app.handle().clone();       // <-- important: pass owned handle
       let py = spawn_python(handle)?;          // spawn bridge
       app.manage(py);                          // store stdin in State<PyProc>
+      let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(|| ".".into());
+      let logdir = std::env::var_os("VESP_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(home.join(".config/vespulaa/logs"));
+
+      let app_log    = logdir.join("mesh_app.log");     // will feed the "nodes" tab (per your ask)
+      let devkey_log = logdir.join("mesh_devkey.log");  // will feed the "devkey" tab
+
+      // Read last 64KB on first load, then stream new lines
+      tail_file_to_event(app.handle().clone(),    app_log,    "log:nodes",  64);
+      tail_file_to_event(app.handle().clone(),    devkey_log, "log:devkey", 64);
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![

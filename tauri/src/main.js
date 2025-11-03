@@ -78,7 +78,15 @@ document.addEventListener("DOMContentLoaded", async () => {
   setTab("app");
 
   Object.entries(panes).forEach(([tab, el]) => {
-    el.addEventListener("scroll", () => { stickToBottom[tab] = nearBottom(el); });
+    stickToBottom[tab] = true;
+    
+    el.addEventListener("scroll", () => { 
+      const atBottom = nearBottom(el);
+      if (!atBottom) stickToBottom[tab] = false;
+      else stickToBottom[tab] = true;
+    });
+    el.addEventListener("wheel", () => { stickToBottom[tab] = nearBottom(el); }, { passive: true });
+    el.addEventListener("mousedown", () => { stickToBottom[tab] = nearBottom(el); });    
   });
   
   // single-select behavior on the UUID list
@@ -169,6 +177,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (listen) {
     await listen("log:app",    (e) => push("app", String(e.payload)));
     await listen("log:python", (e) => push("app", String(e.payload)));
+    await listen("log:nodes",  (e) => push("nodes",  String(e.payload)));
+    await listen("log:devkey", (e) => push("devkey", String(e.payload)));
     await listen("resp:cmd",   (e) => {
       const { cmd, ok, msg } = e.payload || {};
       setStatus(`${cmd} → ${ok ? "ok" : "error"}`);
