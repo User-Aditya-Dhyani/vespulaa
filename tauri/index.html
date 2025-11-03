@@ -17,7 +17,6 @@
       <button class="btn" data-cmd="config_local_client">Config Local Client</button>
     </div>
     <div class="right">
-      <!-- Menu opens overlay with actions (e.g., open Scan Panel) -->
       <button class="btn" id="menuBtn" title="Menu">☰</button>
     </div>
   </header>
@@ -28,14 +27,13 @@
       <span class="icon">🔍</span>
       <span>Scan Panel</span>
     </div>
-    <!-- Add more items here later if needed -->
   </div>
 
   <div id="boot-marker" style="position:fixed;bottom:8px;right:12px;font:12px/1.2 monospace;opacity:.6">
     HTML loaded… waiting for JS
   </div>
 
-  <main class="grid"><!-- default: scan panel hidden (via CSS) -->
+  <main class="grid"><!-- default: scan panel hidden (via CSS until .scan-open) -->
     <!-- Primary column -->
     <section class="rightcol card">
       <nav id="logTabs">
@@ -45,10 +43,18 @@
       </nav>
 
       <div id="nodes-dash" class="nodes hidden">
+        <div class="nodes-topbar">
+          <input id="nodesFilter" class="in" placeholder="Filter by name / uuid / unicast / model / state…" />
+        </div>
+
         <div class="nodes-head">
-          <div class="col name">Name</div>
-          <div class="col uuid">UUID</div>
-          <div class="col unicast">Unicast</div>
+          <div class="col name sortable" data-key="name">Name</div>
+          <div class="col state sortable" data-key="state">State</div>
+          <div class="col elements sortable" data-key="elements">Elements</div>
+          <div class="col model sortable" data-key="model">Model</div>
+          <div class="col last_onoff sortable" data-key="last_onoff">Last On/Off</div>
+          <div class="col uuid sortable" data-key="uuid">UUID</div>
+          <div class="col unicast sortable" data-key="unicast">Unicast</div>
           <div class="col actions">Actions</div>
         </div>
         <div id="nodes-body" class="nodes-body"></div>

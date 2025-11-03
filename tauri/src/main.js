@@ -11,9 +11,14 @@ const scanMap = new Map(); // uuid -> best RSSI
 const nodeNames = new Map(); // uuid -> friendly name
 let nodesDb = {};            // full Python-maintained DB (uuid_hex -> object)
 
+// UI state (in-memory only)
+let nodesFilter = "";
+let nodesSort = { key: "name", dir: "asc" }; // name|state|elements|model|last_onoff|uuid|unicast
+
 // ---------- utils ----------
 function toBottom(el){ el.scrollTop = el.scrollHeight; }
 function nearBottom(el, pad=12){ return el.scrollHeight - el.clientHeight - el.scrollTop < pad; }
+function clamp(n,min,max){ return Math.max(min, Math.min(max, n)); }
 
 function setTab(tab){
   currentTab = tab;
@@ -46,8 +51,8 @@ function toHexUnicast(u) {
   if (u == null) return "";
   if (typeof u === "string") {
     const s = u.trim().toLowerCase();
-    if (/^0x[0-9a-f]+$/.test(s)) return s.slice(2);
-    if (/^[0-9a-f]+$/.test(s)) return s;
+    if (/^0x[0-9a-f]+$/.test(s)) return s.slice(2).padStart(4,"0");
+    if (/^[0-9a-f]+$/.test(s))   return s.padStart(4,"0");
     if (/^\d+$/.test(s)) { // decimal string
       const n = BigInt(s);
       let hx = n.toString(16);
@@ -66,6 +71,103 @@ function toHexUnicast(u) {
   } catch {
     return "";
   }
+}
+
+function formatModelId(v){
+  if (v == null) return "";
+  if (typeof v === "string" && v.trim() === "") return "";
+  let n;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (/^0x[0-9a-f]+$/.test(s)) n = parseInt(s, 16);
+    else if (/^[0-9a-f]+$/.test(s)) n = parseInt(s, 16);
+    else if (/^\d+$/.test(s)) n = parseInt(s, 10);
+  } else if (typeof v === "number") {
+    n = v;
+  }
+  if (Number.isFinite(n)) {
+    let hx = n.toString(16).toUpperCase();
+    hx = hx.padStart(4,"0");
+    return "0x" + hx;
+  }
+  return String(v);
+}
+
+function formatElements(v){
+  if (v == null) return "";
+  if (Array.isArray(v)) return String(v.length);
+  if (typeof v === "object") return Object.keys(v).length ? String(Object.keys(v).length) : "";
+  if (typeof v === "number") return String(clamp(v,0,9999));
+  return String(v);
+}
+
+// last_onoff: show On/Off (model 1000 semantics): 1 -> On, 0 -> Off
+function formatLastOnOffBool(v){
+  if (v == null) return "";
+  if (typeof v === "string" && /^\d+$/.test(v)) v = parseInt(v,10);
+  if (v === 1) return "On";
+  if (v === 0) return "Off";
+  return "";
+}
+
+// --- Extract 'state' robustly from nodes.json ---
+function extractState(info){
+  if (!info || typeof info !== "object") return undefined;
+  let s = info.state;
+  if (s && typeof s === "object") {
+    s = s.value ?? s.name ?? s.state ?? s.status;
+  }
+  if (typeof s !== "string") {
+    s = info.status ?? info.node_state;
+  }
+  if (typeof s === "number") s = String(s);
+  if (typeof s === "string") return s.trim();
+  return undefined;
+}
+
+/*
+  State vocabulary sourced from controller.py:
+
+  Provisioning pipeline:
+    provisioning -> appkey_sent -> appkey_ok -> bind_sent -> bind_ok -> pub_sent -> pub_ok
+
+  Other / runtime / admin:
+    reset_sent (we hide these rows), error/fail/timeout, attached/attach, scanning/seen/discovered/pending
+*/
+const STATE_INFO = {
+  // terminal + admin
+  "pub_ok":        { label: "Provisioned",      prio: 90, cls: "ok" },       // final success
+  "reset_sent":    { label: "Reset Sent",       prio: 10, cls: "muted", hide: true }, // UI: hidden
+
+  // provisioning (descending importance)
+  "pub_sent":      { label: "Publish Sent",     prio: 85, cls: "info" },
+  "bind_ok":       { label: "Bind OK",          prio: 80, cls: "info" },
+  "bind_sent":     { label: "Bind Sent",        prio: 75, cls: "info" },
+  "appkey_ok":     { label: "AppKey OK",        prio: 70, cls: "info" },
+  "appkey_sent":   { label: "AppKey Sent",      prio: 65, cls: "info" },
+  "provisioning":  { label: "Provisioning…",    prio: 60, cls: "warn" },
+
+  // discovery / runtime (optional convenience states)
+  "attached":      { label: "Attached",         prio: 50, cls: "ok" },
+  "attach":        { label: "Attaching…",       prio: 48, cls: "info" },
+  "scanning":      { label: "Scanning",         prio: 45, cls: "info" },
+  "seen":          { label: "Seen",             prio: 44, cls: "info" },
+  "discovered":    { label: "Discovered",       prio: 43, cls: "info" },
+  "pending":       { label: "Pending",          prio: 40, cls: "warn" },
+
+  // failure
+  "error":         { label: "Error",            prio: 5,  cls: "bad" },
+  "fail":          { label: "Error",            prio: 5,  cls: "bad" },
+  "timeout":       { label: "Timeout",          prio: 5,  cls: "bad" },
+
+  // fallback
+  "unknown":       { label: "Unknown",          prio: 1,  cls: "muted" },
+};
+
+function stateDisplay(stateRaw){
+  const s = String(stateRaw || "unknown").toLowerCase();
+  if (STATE_INFO[s]) return { key: s, ...STATE_INFO[s] };
+  return { key: s, ...STATE_INFO["unknown"] };
 }
 
 async function refreshNodesDb() {
@@ -103,6 +205,32 @@ async function saveNodeName(uuid, name) {
   }
 }
 
+// --- toasts ---
+function toast(msg, kind="info"){
+  let wrap = $("#toastWrap");
+  if (!wrap){
+    wrap = document.createElement("div");
+    wrap.id = "toastWrap";
+    document.body.appendChild(wrap);
+  }
+  const t = document.createElement("div");
+  t.className = `toast ${kind}`;
+  t.textContent = msg;
+  wrap.appendChild(t);
+  setTimeout(()=>{ t.classList.add("show"); }, 10);
+  setTimeout(()=>{ t.classList.remove("show"); setTimeout(()=>t.remove(), 200); }, 2200);
+}
+
+// --- copy helpers ---
+async function copyText(txt){
+  try {
+    await navigator.clipboard.writeText(txt);
+    toast("Copied", "ok");
+  } catch {
+    toast("Copy failed", "err");
+  }
+}
+
 function renderScanList(){
   const ul = $("#scanList"); if (!ul) return;
   const prevSel = getSelectedUuid();
@@ -117,7 +245,7 @@ function renderScanList(){
   });
 }
 
-// New: render from nodes.json DB if present; otherwise fall back to scans.
+// New: render from nodes.json DB with filter & sort; otherwise fall back to scans.
 function renderNodesDash() {
   const body = $("#nodes-body"); if (!body) return;
   const stick = nearBottom(body);
@@ -127,22 +255,93 @@ function renderNodesDash() {
   const useDb = dbEntries.length > 0;
 
   if (useDb) {
-    for (const [uuid, info] of dbEntries) {
+    // Build normalized rows for sorting/filtering
+    let rows = dbEntries.map(([uuid, info]) => {
+      const uuidClean = cleanUuid(uuid);
+      const isLocal = uuidClean === "cae";
+      const name = getNodeName(uuidClean);
+
+      // read 'state' directly (includes provisioning states from controller.py)
+      const rawState = extractState(info);
+      const st = stateDisplay(rawState);
+
+      // hide if reset_sent
+      const hide = st.hide === true;
+
+      // unicast
+      const unicastRaw = (info && typeof info === "object" && info.unicast != null) ? info.unicast : "";
+      let unicastHex = toHexUnicast(unicastRaw);
+      if (isLocal) unicastHex = "0001";
+
+      // more fields
+      const elements = formatElements(info?.elements);
+      const model = formatModelId(info?.model_id);
+      const last_onoff_txt = formatLastOnOffBool(info?.last_onoff);
+
+      return {
+        uuid: uuidClean,
+        isLocal,
+        name,
+        elements,
+        model,
+        last_onoff_txt,
+        unicastHex,
+        state: st,  // {label, prio, cls, key, hide?}
+        _hide: hide,
+        _raw: info
+      };
+    });
+
+    // Filter out hidden (e.g., reset_sent)
+    rows = rows.filter(r => !r._hide);
+
+    // Free-text Filter
+    if (nodesFilter.trim()) {
+      const q = nodesFilter.trim().toLowerCase();
+      rows = rows.filter(r =>
+        r.name.toLowerCase().includes(q) ||
+        r.uuid.toLowerCase().includes(q) ||
+        (r.unicastHex || "").toLowerCase().includes(q) ||
+        (r.model || "").toLowerCase().includes(q) ||
+        r.state.label.toLowerCase().includes(q)
+      );
+    }
+
+    // Sort
+    const keyMap = {
+      name:        r => r.name,
+      state:       r => r.state ? (1000 - r.state.prio) + "_" + r.state.label : 999,
+      elements:    r => parseInt(r.elements || "0", 10) || 0,
+      model:       r => r.model || "",
+      last_onoff:  r => r.last_onoff_txt || "",
+      uuid:        r => r.uuid,
+      unicast:     r => r.unicastHex || ""
+    };
+    const key = nodesSort.key in keyMap ? nodesSort.key : "name";
+    rows.sort((a,b)=>{
+      const av = keyMap[key](a);
+      const bv = keyMap[key](b);
+      if (typeof av === "number" && typeof bv === "number") return (nodesSort.dir==="asc"?1:-1)*(av-bv);
+      return (nodesSort.dir==="asc"?1:-1) * String(av).localeCompare(String(bv));
+    });
+
+    // Render rows
+    for (const r of rows) {
       const row = document.createElement("div");
       row.className = "nodes-row";
 
       // ---- Name (inline editable) ----
       const nameCol = document.createElement("div");
-      nameCol.className = "col name";
+      nameCol.className = "col name cell";
       const view = document.createElement("div");
       view.className = "name-view";
-      view.textContent = getNodeName(uuid);
+      view.textContent = r.name;
       nameCol.appendChild(view);
 
       view.addEventListener("click", () => {
         const edit = document.createElement("input");
         edit.className = "name-edit";
-        edit.value = getNodeName(uuid);
+        edit.value = r.name;
         nameCol.replaceChild(edit, view);
         edit.focus(); edit.select();
 
@@ -151,10 +350,10 @@ function renderNodesDash() {
           if (done) return;
           done = true;
           const val = edit.value;
-          await saveNodeName(uuid, val);
-          view.textContent = getNodeName(uuid);
+          await saveNodeName(r.uuid, val);
+          view.textContent = getNodeName(r.uuid);
           nameCol.replaceChild(view, edit);
-          push("app", `[UI] name saved for ${uuid}: "${val || uuid}"`);
+          push("app", `[UI] name saved for ${r.uuid}: "${val || r.uuid}"`);
         };
         const cancel = () => {
           if (done) return;
@@ -168,52 +367,89 @@ function renderNodesDash() {
         edit.addEventListener("blur", commit);
       });
 
-      // ---- UUID ----
+      // ---- State (badge) ----
+      const stateCol = document.createElement("div");
+      stateCol.className = "col state cell";
+      const badge = document.createElement("span");
+      badge.className = `badge ${r.state.cls}`;
+      badge.textContent = r.state.label;
+      stateCol.appendChild(badge);
+
+      // ---- Elements ----
+      const elemCol = document.createElement("div");
+      elemCol.className = "col elements cell right";
+      elemCol.textContent = r.elements;
+
+      // ---- Model ----
+      const modelCol = document.createElement("div");
+      modelCol.className = "col model cell";
+      modelCol.textContent = r.model;
+
+      // ---- Last On/Off ----
+      const lastCol = document.createElement("div");
+      lastCol.className = "col last_onoff cell";
+      lastCol.textContent = r.last_onoff_txt;
+
+      // ---- UUID (with copy) ----
       const uuidCol = document.createElement("div");
-      uuidCol.className = "col uuid";
-      const uuidClean = cleanUuid(uuid);
-      uuidCol.textContent = uuidClean;
+      uuidCol.className = "col uuid cell mono";
+      const uuidSpan = document.createElement("span");
+      uuidSpan.textContent = r.uuid;
+      const uuidCopy = document.createElement("button");
+      uuidCopy.className = "mini";
+      uuidCopy.title = "Copy UUID";
+      uuidCopy.textContent = "⧉";
+      uuidCopy.addEventListener("click", ()=>copyText(r.uuid));
+      uuidCol.appendChild(uuidSpan); uuidCol.appendChild(uuidCopy);
 
-      // ---- Unicast (from nodes.json) ----
+      // ---- Unicast (with copy) ----
       const unicastCol = document.createElement("div");
-      unicastCol.className = "col unicast";
-
-      const isLocal = uuidClean === "cae";
-      let rawUnicast = (info && typeof info === "object" && info.unicast != null) ? info.unicast : "";
-      let unicastHex = toHexUnicast(rawUnicast);
-      if (isLocal) unicastHex = "0001"; // rule: local 'cae' always 0001
-      unicastCol.textContent = unicastHex;
+      unicastCol.className = "col unicast cell mono";
+      const uniSpan = document.createElement("span");
+      uniSpan.textContent = r.unicastHex;
+      const uniCopy = document.createElement("button");
+      uniCopy.className = "mini";
+      uniCopy.title = "Copy Unicast";
+      uniCopy.textContent = "⧉";
+      uniCopy.disabled = !r.unicastHex;
+      uniCopy.addEventListener("click", ()=>copyText(r.unicastHex));
+      unicastCol.appendChild(uniSpan); unicastCol.appendChild(uniCopy);
 
       // ---- Actions: Reset using row's unicast ----
       const actionsCol = document.createElement("div");
-      actionsCol.className = "col actions";
+      actionsCol.className = "col actions cell right";
 
-      if (!isLocal) {
+      if (!r.isLocal) {
         const btnReset = document.createElement("button");
         btnReset.className = "btn warn";
         btnReset.textContent = "Reset";
         btnReset.title = "Reset this node via unicast from nodes.json";
-        if (!unicastHex) {
+        if (!r.unicastHex) {
           btnReset.disabled = true;
           btnReset.title = "No valid unicast in nodes.json for this node";
         }
         btnReset.addEventListener("click", () => {
-          if (!unicastHex) {
-            push("app", `[UI] reset_node: missing/invalid unicast for ${getNodeName(uuid)}`);
+          if (!r.unicastHex) {
+            push("app", `[UI] reset_node: missing/invalid unicast for ${r.name}`);
             return;
           }
-          push("app", `[UI] reset_node → ${getNodeName(uuid)} (${unicastHex})`);
-          send("reset_node", { unicast: unicastHex });
+          push("app", `[UI] reset_node → ${r.name} (${r.unicastHex})`);
+          toast(`Reset sent to ${r.name}`, "ok");
+          send("reset_node", { unicast: r.unicastHex });
         });
         actionsCol.appendChild(btnReset);
       } else {
-        const dot = document.createElement("span");
-        dot.textContent = "—";
-        dot.style.opacity = "0.6";
-        actionsCol.appendChild(dot);
+        const dash = document.createElement("span");
+        dash.textContent = "—";
+        dash.style.opacity = "0.6";
+        actionsCol.appendChild(dash);
       }
 
       row.appendChild(nameCol);
+      row.appendChild(stateCol);
+      row.appendChild(elemCol);
+      row.appendChild(modelCol);
+      row.appendChild(lastCol);
       row.appendChild(uuidCol);
       row.appendChild(unicastCol);
       row.appendChild(actionsCol);
@@ -227,7 +463,7 @@ function renderNodesDash() {
       row.className = "nodes-row";
 
       const nameCol = document.createElement("div");
-      nameCol.className = "col name";
+      nameCol.className = "col name cell";
       const view = document.createElement("div");
       view.className = "name-view";
       view.textContent = getNodeName(uuid);
@@ -262,22 +498,19 @@ function renderNodesDash() {
         edit.addEventListener("blur", commit);
       });
 
-      const uuidCol = document.createElement("div"); uuidCol.className = "col uuid"; uuidCol.textContent = cleanUuid(uuid);
+      const stateCol = document.createElement("div"); stateCol.className = "col state cell"; stateCol.textContent = "";
+      const elemCol  = document.createElement("div"); elemCol.className  = "col elements cell right"; elemCol.textContent  = "";
+      const modelCol = document.createElement("div"); modelCol.className = "col model cell"; modelCol.textContent = "";
+      const lastCol  = document.createElement("div"); lastCol.className  = "col last_onoff cell"; lastCol.textContent  = "";
+      const uuidCol  = document.createElement("div"); uuidCol.className  = "col uuid cell mono"; uuidCol.textContent  = cleanUuid(uuid);
+      const uniCol   = document.createElement("div"); uniCol.className   = "col unicast cell mono"; uniCol.textContent   = `RSSI ${String(rssi)}`;
+      const actCol   = document.createElement("div"); actCol.className   = "col actions cell right";
+      const btnReset = document.createElement("button"); btnReset.className = "btn warn"; btnReset.textContent = "Reset"; btnReset.disabled = true;
+      actCol.appendChild(btnReset);
 
-      const unicastCol = document.createElement("div");
-      unicastCol.className = "col unicast";
-      unicastCol.textContent = `RSSI ${String(rssi)}`;
-
-      const actionsCol = document.createElement("div");
-      actionsCol.className = "col actions";
-      const btnReset = document.createElement("button");
-      btnReset.className = "btn warn";
-      btnReset.textContent = "Reset";
-      btnReset.disabled = true;
-      btnReset.title = "Unavailable (no nodes.json entry)";
-      actionsCol.appendChild(btnReset);
-
-      row.appendChild(nameCol); row.appendChild(uuidCol); row.appendChild(unicastCol); row.appendChild(actionsCol);
+      row.appendChild(nameCol); row.appendChild(stateCol); row.appendChild(elemCol);
+      row.appendChild(modelCol); row.appendChild(lastCol); row.appendChild(uuidCol);
+      row.appendChild(uniCol);   row.appendChild(actCol);
       body.appendChild(row);
     }
   }
@@ -424,6 +657,27 @@ function startApp() {
     const uuid = getSelectedUuid();
     if (!uuid) return push("app", "[UI] provision_selected: nothing selected");
     send("provision_uuid", { uuid });
+  });
+
+  // --- Column sorting handlers ---
+  $all(".nodes-head .sortable").forEach(h => {
+    h.addEventListener("click", () => {
+      const k = h.dataset.key;
+      if (!k) return;
+      if (nodesSort.key === k) {
+        nodesSort.dir = (nodesSort.dir === "asc") ? "desc" : "asc";
+      } else {
+        nodesSort.key = k; nodesSort.dir = "asc";
+      }
+      $all(".nodes-head .sortable").forEach(x => x.dataset.dir = (x.dataset.key === nodesSort.key ? nodesSort.dir : ""));
+      renderNodesDash();
+    });
+  });
+
+  // --- Filter input ---
+  $("#nodesFilter")?.addEventListener("input", (e) => {
+    nodesFilter = e.target.value || "";
+    renderNodesDash();
   });
 
   // --- Events from backend ---
