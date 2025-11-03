@@ -24,114 +24,144 @@ struct PyProc {
   stdin: Arc<Mutex<std::process::ChildStdin>>,
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct NameMap(HashMap<String, String>);
-
-fn names_path() -> PathBuf {
+// ---------- nodes.json location (same org/app as before) ----------
+fn nodes_db_path() -> PathBuf {
   let proj = ProjectDirs::from("org", "vespulaa", "Vespulaa")
     .expect("cannot resolve project dirs");
   let dir = proj.config_dir();
-  let _ = fs::create_dir_all(dir);
-  let mut p = dir.to_path_buf();
-  p.push("nodes.json");
-  p
+  let _ = fs::create_dir_all(&dir);
+  dir.join("nodes.json")
 }
 
-fn read_names() -> NameMap {
-  let p = names_path();
-  match fs::read_to_string(p) {
-    Ok(s) => serde_json::from_str::<NameMap>(&s).unwrap_or_default(),
-    Err(_) => NameMap::default(),
+// ---------- Read/write helpers for nodes.json ----------
+fn read_nodes_value() -> Result<serde_json::Value, String> {
+  let p = nodes_db_path();
+  let s = fs::read_to_string(&p).map_err(|e| format!("read nodes.json failed: {e}"))?;
+  serde_json::from_str::<serde_json::Value>(&s).map_err(|e| format!("parse nodes.json failed: {e}"))
+}
+
+fn write_nodes_value(v: &serde_json::Value) -> Result<(), String> {
+  let p = nodes_db_path();
+  let s = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
+  fs::write(&p, s).map_err(|e| format!("write nodes.json failed: {e}"))
+}
+
+// ---------- Commands ----------
+
+/// Full read of Python-maintained nodes.json (read-only to the UI)
+#[tauri::command]
+async fn read_nodes_db() -> Result<serde_json::Value, String> {
+  read_nodes_value()
+}
+
+/// Return a {uuid -> name} map derived from nodes.json entries that have "name".
+#[tauri::command]
+async fn get_node_names() -> Result<HashMap<String, String>, String> {
+  let mut out: HashMap<String, String> = HashMap::new();
+  let v = read_nodes_value().unwrap_or(serde_json::json!({}));
+  if let Some(obj) = v.as_object() {
+    for (uuid, entry) in obj {
+      if let Some(name) = entry.get("name").and_then(|x| x.as_str()) {
+        let clean: String = uuid.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>().to_lowercase();
+        if clean.len() == 32 && !name.trim().is_empty() {
+          out.insert(clean, name.trim().to_string());
+        }
+      }
+    }
   }
+  Ok(out)
 }
 
-fn write_names(map: &NameMap) -> Result<(), String> {
-  let p = names_path();
-  let s = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
-  fs::write(p, s).map_err(|e| e.to_string())
+/// Update only the "name" field for an entry in nodes.json (create entry if missing).
+/// Performs a no-op if the value is unchanged, to avoid unnecessary writes.
+#[tauri::command]
+async fn set_node_name(uuid: String, name: String) -> Result<(), String> {
+  let clean: String = uuid.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>().to_lowercase();
+  if clean.len() != 32 {
+    return Err("uuid must be 32 hex chars (16 bytes)".into());
+  }
+  let mut root = match read_nodes_value() {
+    Ok(v) => v,
+    Err(_) => serde_json::json!({}), // if missing, start fresh
+  };
+
+  let obj = root.as_object_mut().ok_or("nodes.json root is not an object")?;
+  if !obj.contains_key(&clean) {
+    obj.insert(clean.clone(), serde_json::json!({}));
+  }
+
+  let entry = obj.get_mut(&clean).and_then(|v| v.as_object_mut()).ok_or("entry is not an object")?;
+  let trimmed = name.trim();
+  let current = entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+  if trimmed.is_empty() {
+    // remove only if present; otherwise skip write
+    if entry.get("name").is_some() {
+      entry.remove("name");
+    } else {
+      return Ok(());
+    }
+  } else {
+    if current == trimmed {
+      return Ok(()); // no change
+    }
+    entry.insert("name".to_string(), serde_json::Value::String(trimmed.to_string()));
+  }
+
+  write_nodes_value(&root)
 }
 
-// ---------- Commands mapping 1:1 to your Controller ----------
+// ---------- Python bridge passthrough commands ----------
 #[tauri::command]
 async fn create_network(py: State<'_, PyProc>) -> Result<(), String> {
   send_cmd(&py, r#"{"cmd":"create_network"}"#)
 }
-
 #[tauri::command]
 async fn attach(py: State<'_, PyProc>) -> Result<(), String> {
   send_cmd(&py, r#"{"cmd":"attach"}"#)
 }
-
 #[tauri::command]
 async fn detach(py: State<'_, PyProc>) -> Result<(), String> {
   send_cmd(&py, r#"{"cmd":"detach"}"#)
 }
-
 #[tauri::command]
 async fn leave(py: State<'_, PyProc>) -> Result<(), String> {
   send_cmd(&py, r#"{"cmd":"leave"}"#)
 }
-
 #[tauri::command]
 async fn purge(py: State<'_, PyProc>) -> Result<(), String> {
   send_cmd(&py, r#"{"cmd":"purge"}"#)
 }
-
 #[tauri::command]
 async fn config_local_client(py: State<'_, PyProc>) -> Result<(), String> {
   send_cmd(&py, r#"{"cmd":"config_local_client"}"#)
 }
-
 #[tauri::command]
 async fn scan_start(py: State<'_, PyProc>, seconds: Option<u64>) -> Result<(), String> {
   let secs = seconds.unwrap_or(15);
   send_cmd(&py, &format!(r#"{{"cmd":"scan_start","seconds":{}}}"#, secs))
 }
-
 #[tauri::command]
 async fn scan_stop(py: State<'_, PyProc>) -> Result<(), String> {
   send_cmd(&py, r#"{"cmd":"scan_stop"}"#)
 }
-
 #[tauri::command]
 async fn provision_uuid(py: State<'_, PyProc>, uuid: String) -> Result<(), String> {
   send_cmd(&py, &format!(r#"{{"cmd":"provision_uuid","uuid":"{}"}}"#, uuid))
 }
-
 #[tauri::command]
 async fn reset_node(py: State<'_, PyProc>, unicast: String) -> Result<(), String> {
   send_cmd(&py, &format!(r#"{{"cmd":"reset_node","unicast":"{}"}}"#, unicast))
 }
 
-#[tauri::command]
-async fn get_node_names() -> Result<HashMap<String, String>, String> {
-  Ok(read_names().0)
-}
-
-#[tauri::command]
-async fn set_node_name(uuid: String, name: String) -> Result<(), String> {
-  let clean = uuid.replace(|c: char| !c.is_ascii_hexdigit(), "").to_lowercase();
-  if clean.len() != 32 {
-    return Err("uuid must be 32 hex chars (16 bytes)".into());
-  }
-  let mut nm = read_names();
-  if name.trim().is_empty() {
-    nm.0.remove(&clean);
-  } else {
-    nm.0.insert(clean, name.trim().to_string());
-  }
-  write_names(&nm)
-}
-
 fn send_cmd(py: &PyProc, line: &str) -> Result<(), String> {
-  let mut guard = py
-    .stdin
+  let mut guard = py.stdin
     .lock()
     .map_err(|_| "bridge stdin lock poisoned".to_string())?;
   guard
     .write_all(line.as_bytes())
     .and_then(|_| guard.write_all(b"\n"))
-  .map_err(|e| format!("write failed: {e}"))
+    .map_err(|e| format!("write failed: {e}"))
 }
 
 // Spawn python bridge: we use vesp.tauri_bridge
@@ -228,7 +258,7 @@ fn spawn_python(handle: tauri::AppHandle) -> Result<PyProc, Box<dyn std::error::
   Ok(PyProc { stdin })
 }
 
-use std::{fs::File, io::{Seek, SeekFrom}, time::Duration};
+use std::{fs::File, io::{Seek, SeekFrom}, time::{Duration, SystemTime}};
 
 fn tail_file_to_event(handle: tauri::AppHandle, path: PathBuf, event: &'static str, read_last_kb: u64) {
   std::thread::spawn(move || {
@@ -269,13 +299,47 @@ fn tail_file_to_event(handle: tauri::AppHandle, path: PathBuf, event: &'static s
   });
 }
 
+// Watch nodes.json mtime and notify UI only when it actually changes
+fn watch_nodes_file(handle: tauri::AppHandle, path: PathBuf) {
+  std::thread::spawn(move || {
+    let mut last_mod: Option<SystemTime> = None;
+    loop {
+      match fs::metadata(&path) {
+        Ok(meta) => {
+          if let Ok(modt) = meta.modified() {
+            let changed = match last_mod {
+              None => true,
+              Some(prev) => modt > prev,
+            };
+            if changed {
+              last_mod = Some(modt);
+              // small debounce to allow the writer to finish
+              std::thread::sleep(Duration::from_millis(60));
+              let _ = handle.emit("nodes:changed", "nodes.json updated");
+            }
+          }
+        }
+        Err(_) => {
+          // If file disappears (purge), still notify once
+          if last_mod.take().is_some() {
+            let _ = handle.emit("nodes:changed", "nodes.json removed");
+          }
+        }
+      }
+      std::thread::sleep(Duration::from_millis(250));
+    }
+  });
+}
+
 fn main() {
   tauri::Builder::default()
     .setup(|app| {
       let handle = app.handle().clone();
       let _ = handle.emit("log:app", "[RUST] starting python bridge");
-      let py = spawn_python(handle)?;          // spawn bridge
+      let py = spawn_python(handle.clone())?;  // spawn bridge
       app.manage(py);                          // store stdin in State<PyProc>
+
+      // start log tailers
       let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(|| ".".into());
       let logdir = std::env::var_os("VESP_LOG_DIR")
         .map(std::path::PathBuf::from)
@@ -286,9 +350,15 @@ fn main() {
 
       tail_file_to_event(app.handle().clone(), app_log,    "log:nodes",  64);
       tail_file_to_event(app.handle().clone(), devkey_log, "log:devkey", 64);
+
+      // watch nodes.json for true changes (mtime) and notify UI
+      let nodes_path = nodes_db_path();
+      watch_nodes_file(app.handle().clone(), nodes_path);
+
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
+      // python bridge passthrough
       create_network,
       attach,
       detach,
@@ -299,8 +369,10 @@ fn main() {
       scan_stop,
       provision_uuid,
       reset_node,
+      // nodes.json integration
+      read_nodes_db,
       get_node_names,
-      set_node_name
+      set_node_name,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

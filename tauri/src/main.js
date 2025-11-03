@@ -1,5 +1,3 @@
-// tauri/src/main.js
-
 // ---------------- app code (define first to avoid TDZ) ----------------
 function $(s){ return document.querySelector(s); }
 function $all(s){ return Array.from(document.querySelectorAll(s)); }
@@ -8,7 +6,10 @@ const panes = {};
 let currentTab = "app";
 const stickToBottom = { nodes: true, devkey: true, app: true };
 const scanMap = new Map(); // uuid -> best RSSI
+
+// Names are now sourced from nodes.json; this is a UI cache.
 const nodeNames = new Map(); // uuid -> friendly name
+let nodesDb = {};            // full Python-maintained DB (uuid_hex -> object)
 
 function toBottom(el){ el.scrollTop = el.scrollHeight; }
 function nearBottom(el, pad=12){ return el.scrollHeight - el.clientHeight - el.scrollTop < pad; }
@@ -34,26 +35,44 @@ function push(tab, text){
 function setStatus(t){ const s=$("#status"); if(s) s.textContent = `Status: ${t}`; }
 
 function cleanUuid(u) { return String(u).replace(/[^0-9a-fA-F]/g, "").toLowerCase(); }
-function getNodeName(uuid) { const u = cleanUuid(uuid); return nodeNames.get(u) || u; }
+function getNodeName(uuid) {
+  const u = cleanUuid(uuid);
+  return nodeNames.get(u) || u;
+}
 
-async function loadNodeNames() {
+async function refreshNodesDb() {
   const invoke = window.__VESPU_INVOKE__;
   try {
-    const map = await invoke?.("get_node_names");
-    if (map && typeof map === "object") {
-      Object.entries(map).forEach(([u, n]) => nodeNames.set(cleanUuid(u), String(n)));
+    const db = await invoke?.("read_nodes_db");
+    if (db && typeof db === "object") {
+      nodesDb = db;
+      // Refresh name cache from DB (entry.name if present)
+      nodeNames.clear();
+      for (const [uuid, entry] of Object.entries(nodesDb)) {
+        const nm = (entry && typeof entry === "object" && entry.name) ? String(entry.name) : "";
+        if (nm.trim()) nodeNames.set(cleanUuid(uuid), nm.trim());
+      }
+    } else {
+      nodesDb = {};
+      nodeNames.clear();
     }
   } catch (e) {
-    push("app", `[WARN] get_node_names failed: ${e}`);
+    nodesDb = {};
+    push("app", `[WARN] read_nodes_db failed: ${e}`);
   }
 }
+
 async function saveNodeName(uuid, name) {
   const u = cleanUuid(uuid);
   const invoke = window.__VESPU_INVOKE__;
   try {
     await invoke?.("set_node_name", { uuid: u, name: String(name) });
+    // Update UI cache immediately
     if (String(name).trim()) nodeNames.set(u, String(name).trim());
     else nodeNames.delete(u);
+    // Also update our nodesDb mirror so re-render shows it
+    if (!nodesDb[u] || typeof nodesDb[u] !== "object") nodesDb[u] = {};
+    nodesDb[u].name = String(name);
   } catch (e) {
     push("app", `[ERR] set_node_name(${u}) failed: ${e}`);
   }
@@ -73,53 +92,132 @@ function renderScanList(){
   });
 }
 
+// New: render from nodes.json DB if present; otherwise fall back to scans.
 function renderNodesDash() {
   const body = $("#nodes-body"); if (!body) return;
-  const entries = [...scanMap.entries()].sort((a,b)=> b[1]-a[1]);
   const stick = nearBottom(body);
   body.innerHTML = "";
-  for (const [uuid, rssi] of entries) {
-    const row = document.createElement("div");
-    row.className = "nodes-row";
 
-    const nameCol = document.createElement("div");
-    nameCol.className = "col name";
-    const view = document.createElement("div");
-    view.className = "name-view";
-    view.textContent = getNodeName(uuid);
-    nameCol.appendChild(view);
+  const dbEntries = Object.entries(nodesDb || {}); // [uuid, info]
+  const useDb = dbEntries.length > 0;
 
-    view.addEventListener("click", () => {
-      const edit = document.createElement("input");
-      edit.className = "name-edit";
-      edit.value = getNodeName(uuid);
-      nameCol.replaceChild(edit, view);
-      edit.focus(); edit.select();
+  if (useDb) {
+    for (const [uuid, info] of dbEntries) {
+      const row = document.createElement("div");
+      row.className = "nodes-row";
 
-      const commit = async () => {
-        const val = edit.value;
-        await saveNodeName(uuid, val);
-        view.textContent = getNodeName(uuid);
-        nameCol.replaceChild(view, edit);
-        push("app", `[UI] name saved for ${uuid}: "${val || uuid}"`);
-      };
-      const cancel = () => { nameCol.replaceChild(view, edit); };
-      edit.addEventListener("keydown", (e) => { if (e.key === "Enter") commit(); else if (e.key === "Escape") cancel(); });
-      edit.addEventListener("blur", commit);
-    });
+      const nameCol = document.createElement("div");
+      nameCol.className = "col name";
+      const view = document.createElement("div");
+      view.className = "name-view";
+      view.textContent = getNodeName(uuid);
+      nameCol.appendChild(view);
 
-    const uuidCol = document.createElement("div"); uuidCol.className = "col uuid"; uuidCol.textContent = cleanUuid(uuid);
-    const rssiCol = document.createElement("div"); rssiCol.className = "col rssi"; rssiCol.textContent = String(rssi);
+      view.addEventListener("click", () => {
+        const edit = document.createElement("input");
+        edit.className = "name-edit";
+        edit.value = getNodeName(uuid);
+        nameCol.replaceChild(edit, view);
+        edit.focus(); edit.select();
 
-    const actionsCol = document.createElement("div"); actionsCol.className = "col actions";
-    const btnMsg = document.createElement("button");
-    btnMsg.className = "btn"; btnMsg.textContent = "Message"; btnMsg.title = "Future: send model cmd";
-    btnMsg.addEventListener("click", () => { push("app", `[UI] (future) send message → ${getNodeName(uuid)}`); });
-    actionsCol.appendChild(btnMsg);
+        let done = false;
+        const commit = async () => {
+          if (done) return;
+          done = true;
+          const val = edit.value;
+          await saveNodeName(uuid, val);
+          view.textContent = getNodeName(uuid);
+          nameCol.replaceChild(view, edit);
+          push("app", `[UI] name saved for ${uuid}: "${val || uuid}"`);
+        };
+        const cancel = () => {
+          if (done) return;
+          done = true;
+          nameCol.replaceChild(view, edit);
+        };
+        edit.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") { e.preventDefault(); commit(); }
+          else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+        });
+        edit.addEventListener("blur", commit);
+      });
 
-    row.appendChild(nameCol); row.appendChild(uuidCol); row.appendChild(rssiCol); row.appendChild(actionsCol);
-    body.appendChild(row);
+      const uuidCol = document.createElement("div");
+      uuidCol.className = "col uuid";
+      uuidCol.textContent = cleanUuid(uuid);
+
+      const rssiCol = document.createElement("div");
+      rssiCol.className = "col rssi";
+      const rssi = (info && typeof info === "object" && info.best_rssi != null) ? info.best_rssi : "";
+      rssiCol.textContent = String(rssi);
+
+      const actionsCol = document.createElement("div");
+      actionsCol.className = "col actions";
+      const btnMsg = document.createElement("button");
+      btnMsg.className = "btn"; btnMsg.textContent = "Message"; btnMsg.title = "Future: send model cmd";
+      btnMsg.addEventListener("click", () => { push("app", `[UI] (future) send message → ${getNodeName(uuid)}`); });
+      actionsCol.appendChild(btnMsg);
+
+      row.appendChild(nameCol); row.appendChild(uuidCol); row.appendChild(rssiCol); row.appendChild(actionsCol);
+      body.appendChild(row);
+    }
+  } else {
+    // Fallback: legacy “scan-only” rows
+    const entries = [...scanMap.entries()].sort((a,b)=> b[1]-a[1]);
+    for (const [uuid, rssi] of entries) {
+      const row = document.createElement("div");
+      row.className = "nodes-row";
+
+      const nameCol = document.createElement("div");
+      nameCol.className = "col name";
+      const view = document.createElement("div");
+      view.className = "name-view";
+      view.textContent = getNodeName(uuid);
+      nameCol.appendChild(view);
+
+      view.addEventListener("click", () => {
+        const edit = document.createElement("input");
+        edit.className = "name-edit";
+        edit.value = getNodeName(uuid);
+        nameCol.replaceChild(edit, view);
+        edit.focus(); edit.select();
+
+        let done = false;
+        const commit = async () => {
+          if (done) return;
+          done = true;
+          const val = edit.value;
+          await saveNodeName(uuid, val);
+          view.textContent = getNodeName(uuid);
+          nameCol.replaceChild(view, edit);
+          push("app", `[UI] name saved for ${uuid}: "${val || uuid}"`);
+        };
+        const cancel = () => {
+          if (done) return;
+          done = true;
+          nameCol.replaceChild(view, edit);
+        };
+        edit.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") { e.preventDefault(); commit(); }
+          else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+        });
+        edit.addEventListener("blur", commit);
+      });
+
+      const uuidCol = document.createElement("div"); uuidCol.className = "col uuid"; uuidCol.textContent = cleanUuid(uuid);
+      const rssiCol = document.createElement("div"); rssiCol.className = "col rssi"; rssiCol.textContent = String(rssi);
+
+      const actionsCol = document.createElement("div"); actionsCol.className = "col actions";
+      const btnMsg = document.createElement("button");
+      btnMsg.className = "btn"; btnMsg.textContent = "Message"; btnMsg.title = "Future: send model cmd";
+      btnMsg.addEventListener("click", () => { push("app", `[UI] (future) send message → ${getNodeName(uuid)}`); });
+      actionsCol.appendChild(btnMsg);
+
+      row.appendChild(nameCol); row.appendChild(uuidCol); row.appendChild(rssiCol); row.appendChild(actionsCol);
+      body.appendChild(row);
+    }
   }
+
   if (stick) toBottom(body);
 }
 
@@ -136,6 +234,12 @@ function getSelectedUuid() {
   return sel ? sel.dataset.uuid : null;
 }
 
+async function bootAndRender() {
+  // pull nodes.json first, so Nodes tab is filled even before any scan
+  await refreshNodesDb();
+  renderNodesDash();
+}
+
 function startApp() {
   const listen = window.__VESPU_LISTEN__;
 
@@ -146,9 +250,9 @@ function startApp() {
   panes.app   = $("#log-app");
 
   push("app", "[UI] Frontend ready");
-  loadNodeNames().then(() => renderNodesDash());
   setStatus("idle");
-  setTab("app");
+  setTab("nodes"); // show Nodes by default since we now have DB rendering
+  bootAndRender();
 
   Object.entries(panes).forEach(([tab, el]) => {
     if (!el) return;
@@ -199,7 +303,7 @@ function startApp() {
       const name = btn.dataset.cmd;
       if (name === "leave" || name === "purge") {
         if (!confirm(`Are you sure you want to ${name.toUpperCase()}?`)) return;
-        }
+      }
       send(name);
     });
   });
@@ -234,11 +338,33 @@ function startApp() {
       await listen("log:python", (e) => push("app", String(e.payload)));
       await listen("log:nodes",  (e) => push("app", String(e.payload)));
       await listen("log:devkey", (e) => push("devkey", String(e.payload)));
-      await listen("resp:cmd",   (e) => {
+
+      // Debounced one-shot refresh after state-changing commands
+      let refreshTimer = null;
+      function scheduleRefresh(delay = 150) {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(async () => {
+          await refreshNodesDb();
+          renderNodesDash();
+        }, delay);
+      }
+
+      await listen("resp:cmd",   async (e) => {
         const { cmd, ok, msg } = e.payload || {};
         setStatus(`${cmd} → ${ok ? "ok" : "error"}`);
         push("app", `[${ok?"OK":"ERR"}] ${cmd}: ${msg}`);
+
+        if (ok && (cmd === "attach" || cmd === "create_network" || cmd === "provision_uuid" || cmd === "reset_node" || cmd === "config_local_client" || cmd === "leave" || cmd === "purge")) {
+          scheduleRefresh(150); // one refresh, not a loop
+        }
       });
+
+      // Refresh when the actual file on disk changes (emitted by Rust watcher)
+      await listen("nodes:changed", async () => {
+        await refreshNodesDb();
+        renderNodesDash();
+      });
+
       await listen("scan:add",   (e) => {
         const { uuid, rssi } = e.payload || {};
         if (!uuid) return;
@@ -250,7 +376,7 @@ function startApp() {
         const prev = scanMap.get(clean);
         if (prev === undefined || rssi > prev) scanMap.set(clean, rssi|0);
         renderScanList();
-        renderNodesDash();
+        // Nodes tab is DB-driven; scan list is left-only.
       });
     })();
   } else {
@@ -263,7 +389,7 @@ function startApp() {
   const deadline = Date.now() + 5000; // wait up to 5s
   (function poll() {
     const t = window.__TAURI__;
-    if (t && t.core && t.core.invoke && t.event && t.event.listen) {
+    if (t && t.core && t.event && t.event.listen && t.core.invoke) {
       window.__VESPU_INVOKE__ = t.core.invoke;
       window.__VESPU_LISTEN__ = t.event.listen;
       startApp();
