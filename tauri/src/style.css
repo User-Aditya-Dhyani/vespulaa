@@ -123,3 +123,42 @@ h3 { margin: 14px 0 8px; color: var(--muted); font-weight: 600; }
 #logTabs { margin-bottom: 8px; }
 .status { margin-top: 8px; }
 
+.nodes { display: block; }
+.nodes.hidden { display: none; }
+
+.nodes-head, .nodes-row {
+  display: grid;
+  grid-template-columns: 1.2fr 2.2fr 0.6fr 0.8fr;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 8px;
+}
+.nodes-head {
+  font-weight: 600;
+  opacity: .9;
+  border-bottom: 1px solid rgba(255,255,255,.08);
+}
+.nodes-body {
+  max-height: 42vh;
+  overflow: auto;
+  border-radius: 8px;
+}
+.nodes-row {
+  border-bottom: 1px dashed rgba(255,255,255,.06);
+}
+.nodes-row .uuid { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; opacity: .9; }
+.nodes-row .rssi { text-align: right; }
+.nodes-row .actions button { margin-left: 6px; }
+
+.name-view { cursor: text; padding: 4px 6px; border-radius: 6px; }
+.name-view:hover { background: rgba(255,255,255,.05); }
+.name-edit {
+  width: 100%;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,.15);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+

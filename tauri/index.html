@@ -1,4 +1,3 @@
-<!-- tauri/index.html -->
 <!doctype html>
 <html>
 <head>
@@ -24,9 +23,11 @@
       <button class="btn" id="scanStop">Stop</button>
     </div>
   </header>
+
   <div id="boot-marker" style="position:fixed;bottom:8px;right:12px;font:12px/1.2 monospace;opacity:.6">
     HTML loaded… waiting for JS
   </div>
+
   <main class="grid">
     <section class="leftcol card">
       <h3>Unprovisioned (UUID | RSSI)</h3>
@@ -53,15 +54,42 @@
         <button class="tab" data-tab="devkey">DevKey</button>
         <button class="tab" data-tab="app">App</button>
       </nav>
-      <pre id="log-nodes" class="log"></pre>
+
+      <div id="nodes-dash" class="nodes hidden">
+        <div class="nodes-head">
+          <div class="col name">Name</div>
+          <div class="col uuid">UUID</div>
+          <div class="col rssi">Best RSSI</div>
+          <div class="col actions">Actions</div>
+        </div>
+        <div id="nodes-body" class="nodes-body"></div>
+      </div>
+
       <pre id="log-devkey" class="log hidden"></pre>
       <pre id="log-app" class="log hidden"></pre>
       <div class="status" id="status">Status: idle</div>
-
     </section>
   </main>
 
-  <script type="module" src="src/main.js"></script>
+  <!-- Robust loader: try both known Tauri v2 script locations.
+       main.js will wait/poll up to 5s for window.__TAURI__. -->
+  <script>
+    (function loadTauriShim(ready){
+      function inject(src, cb){
+        var s=document.createElement('script');
+        s.src=src; s.onload=cb; s.onerror=cb;
+        document.head.appendChild(s);
+      }
+      if (window.__TAURI__) return ready();
+      inject("/.tauri/tauri.js", function(){
+        if (window.__TAURI__) return ready();
+        inject("tauri.js", ready);
+      });
+    })(function(){ /* shim attempted (ok if it 404s; app will poll) */ });
+  </script>
+
+  <!-- Your app (has its own bootstrap/polling) -->
+  <script defer src="src/main.js"></script>
 </body>
 </html>
 

@@ -1,10 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use serde::Deserialize;
+use serde::{Serialize, Deserialize};
 use std::{
   io::{BufRead, BufReader, Write},
   sync::{Arc, Mutex},
+  fs, path::PathBuf
 };
+use ::std::collections::HashMap;
+use directories::ProjectDirs;
 
 use tauri::{Emitter, Manager, State};
 
@@ -19,6 +22,33 @@ enum PyMsg {
 
 struct PyProc {
   stdin: Arc<Mutex<std::process::ChildStdin>>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct NameMap(HashMap<String, String>);
+
+fn names_path() -> PathBuf {
+  let proj = ProjectDirs::from("org", "vespulaa", "Vespulaa")
+    .expect("cannot resolve project dirs");
+  let dir = proj.config_dir();
+  let _ = fs::create_dir_all(dir);
+  let mut p = dir.to_path_buf();
+  p.push("nodes.json");
+  p
+}
+
+fn read_names() -> NameMap {
+  let p = names_path();
+  match fs::read_to_string(p) {
+    Ok(s) => serde_json::from_str::<NameMap>(&s).unwrap_or_default(),
+    Err(_) => NameMap::default(),
+  }
+}
+
+fn write_names(map: &NameMap) -> Result<(), String> {
+  let p = names_path();
+  let s = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
+  fs::write(p, s).map_err(|e| e.to_string())
 }
 
 // ---------- Commands mapping 1:1 to your Controller ----------
@@ -73,6 +103,26 @@ async fn reset_node(py: State<'_, PyProc>, unicast: String) -> Result<(), String
   send_cmd(&py, &format!(r#"{{"cmd":"reset_node","unicast":"{}"}}"#, unicast))
 }
 
+#[tauri::command]
+async fn get_node_names() -> Result<HashMap<String, String>, String> {
+  Ok(read_names().0)
+}
+
+#[tauri::command]
+async fn set_node_name(uuid: String, name: String) -> Result<(), String> {
+  let clean = uuid.replace(|c: char| !c.is_ascii_hexdigit(), "").to_lowercase();
+  if clean.len() != 32 {
+    return Err("uuid must be 32 hex chars (16 bytes)".into());
+  }
+  let mut nm = read_names();
+  if name.trim().is_empty() {
+    nm.0.remove(&clean);
+  } else {
+    nm.0.insert(clean, name.trim().to_string());
+  }
+  write_names(&nm)
+}
+
 fn send_cmd(py: &PyProc, line: &str) -> Result<(), String> {
   let mut guard = py
     .stdin
@@ -84,7 +134,7 @@ fn send_cmd(py: &PyProc, line: &str) -> Result<(), String> {
   .map_err(|e| format!("write failed: {e}"))
 }
 
-// Spawn python bridge: we use vesp.tauri_bridge (see section 3)
+// Spawn python bridge: we use vesp.tauri_bridge
 fn spawn_python(handle: tauri::AppHandle) -> Result<PyProc, Box<dyn std::error::Error>> {
   use std::path::{Path, PathBuf};
 
@@ -106,11 +156,7 @@ fn spawn_python(handle: tauri::AppHandle) -> Result<PyProc, Box<dyn std::error::
   }
 
   if let Ok(exe) = std::env::current_exe() {
-    // target/debug/tauri-app → parent()=.../debug → parent()=.../target → parent()=repo_root
-    if let Some(p0) = exe.parent()
-      .and_then(|d| d.parent())
-      .and_then(|d| d.parent())
-    {
+    if let Some(p0) = exe.parent().and_then(|d| d.parent()).and_then(|d| d.parent()) {
       candidates.push(p0.to_path_buf());
     }
   }
@@ -182,11 +228,10 @@ fn spawn_python(handle: tauri::AppHandle) -> Result<PyProc, Box<dyn std::error::
   Ok(PyProc { stdin })
 }
 
-use std::{fs::File, io::{Seek, SeekFrom}, path::PathBuf, time::Duration};
+use std::{fs::File, io::{Seek, SeekFrom}, time::Duration};
 
 fn tail_file_to_event(handle: tauri::AppHandle, path: PathBuf, event: &'static str, read_last_kb: u64) {
   std::thread::spawn(move || {
-    // Try to open; if missing, keep retrying silently every 1s
     loop {
       match File::open(&path) {
         Ok(mut f) => {
@@ -200,7 +245,6 @@ fn tail_file_to_event(handle: tauri::AppHandle, path: PathBuf, event: &'static s
           let mut reader = BufReader::new(f);
           let mut buf = String::new();
 
-          // read existing tail immediately
           loop {
             buf.clear();
             match reader.read_line(&mut buf) {
@@ -210,7 +254,6 @@ fn tail_file_to_event(handle: tauri::AppHandle, path: PathBuf, event: &'static s
             }
           }
 
-          // now watch for new lines by polling file size
           loop {
             buf.clear();
             match reader.read_line(&mut buf) {
@@ -229,7 +272,8 @@ fn tail_file_to_event(handle: tauri::AppHandle, path: PathBuf, event: &'static s
 fn main() {
   tauri::Builder::default()
     .setup(|app| {
-      let handle = app.handle().clone();       // <-- important: pass owned handle
+      let handle = app.handle().clone();
+      let _ = handle.emit("log:app", "[RUST] starting python bridge");
       let py = spawn_python(handle)?;          // spawn bridge
       app.manage(py);                          // store stdin in State<PyProc>
       let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(|| ".".into());
@@ -237,12 +281,11 @@ fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or(home.join(".config/vespulaa/logs"));
 
-      let app_log    = logdir.join("mesh_app.log");     // will feed the "nodes" tab (per your ask)
-      let devkey_log = logdir.join("mesh_devkey.log");  // will feed the "devkey" tab
+      let app_log    = logdir.join("mesh_app.log");
+      let devkey_log = logdir.join("mesh_devkey.log");
 
-      // Read last 64KB on first load, then stream new lines
-      tail_file_to_event(app.handle().clone(),    app_log,    "log:nodes",  64);
-      tail_file_to_event(app.handle().clone(),    devkey_log, "log:devkey", 64);
+      tail_file_to_event(app.handle().clone(), app_log,    "log:nodes",  64);
+      tail_file_to_event(app.handle().clone(), devkey_log, "log:devkey", 64);
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
@@ -255,7 +298,9 @@ fn main() {
       scan_start,
       scan_stop,
       provision_uuid,
-      reset_node
+      reset_node,
+      get_node_names,
+      set_node_name
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
