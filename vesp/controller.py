@@ -60,52 +60,37 @@ class Controller:
         self._scan_cb: Callable[[str, int], None] = lambda uuid_hex, rssi: None
 
         # ---------- persistent unicast allocator ----------
-        # read nodes.json and find the highest "end" address we've used;
-        # bump from there so we don't reuse 0x0005 every run
         db = load_nodes_db()
         max_used = 0x0004
         for info in db.values():
             try:
                 base = int(info.get("unicast", 0))
                 elems = int(info.get("elements", 1))
-                end = base + elems  # first free addr after that node's block
+                end = base + elems
                 if end > max_used:
                     max_used = end
             except Exception:
                 pass
 
-        # propose a safe floor well above our own element address.
-        # 0x0010 worked for you. You could even pick 0x0100 if you want to be extra.
         floor_start = 0x0010
-
         nxt = max_used + 1
         if nxt < floor_start:
             nxt = floor_start
-
         self._next_unicast = nxt
-        # now alloc_unicast() will hand out >= 0x0010 every time
-
 
         # GLib main loop for async callbacks from meshd
         self._glib_loop: Optional[GLib.MainLoop] = None
 
-        # our provisioning FSM state for each fresh node
-        # key = unicast int, val = dict:
-        # {
-        #    "uuid": "<hex uuid>",
-        #    "stage": "provisioning" | "appkey_sent" | "appkey_ok"
-        #             | "bind_sent" | "bind_ok"
-        #             | "pub_sent"  | "done",
-        #    "model_id": 0x1000,     # Generic OnOff Server
-        #    "app_idx": 0,           # AppKey index we use
-        #    "elem_addr": <unicast>, # primary element address
-        # }
+        # provisioning FSM state
         self._provision_jobs: Dict[int, Dict[str, Any]] = {}
         try:
             (LOG_DIR / "mesh_app.log").touch(exist_ok=True)
             (LOG_DIR / "mesh_devkey.log").touch(exist_ok=True)
         except Exception:
             pass
+
+        # ---- NEW: receive-gating to make "detach" actually silent ----
+        self._rx_enabled: bool = True  # enabled after attach, disabled on detach
 
     # ---------------- internal helpers ----------------
 
@@ -338,14 +323,15 @@ class Controller:
                 node, _cfg = self._get_mesh().Attach(APP_ROOT, int(tok))
                 self.node_path = str(node)
                 self.mgmt = self.bus.get(MESH_BUS, self.node_path)
+                self._rx_enabled = True  # <--- enable RX on successful attach
                 self.log(f"Attached. Node path: {self.node_path}")
             except Exception as e:
                 emsg = e.args[0] if e.args else str(e)
                 if ("org.bluez.mesh.Error.AlreadyExists" in emsg or
                     "org.bluez.mesh.Error.Busy" in emsg):
-                    # already attached -> just grab proxy
                     if self.node_path:
                         self.mgmt = self.bus.get(MESH_BUS, self.node_path)
+                        self._rx_enabled = True
                         self.log("Attach: daemon reports already attached; rebound mgmt proxy.")
                     else:
                         raise
@@ -372,7 +358,6 @@ class Controller:
         app_idx = 0
         model_id = 0x1001
 
-        # Check if done (persist flag in nodes.json)
         db = load_nodes_db()
         if db.get("local_provisioner", {}).get("appkey_bound", False):
             return True, "Local client already configured (skipped)"
@@ -387,7 +372,6 @@ class Controller:
         if not ok_bind:
             return False, f"Local Bind FAILED: {msg_bind}"
 
-        # Flag as done in nodes.json
         db["local_provisioner"] = {"appkey_bound": True, "configured_at": datetime.now(timezone.utc).isoformat()}
         save_nodes_db(db)
         self.log("[LocalConfig] Local client configured! OnOff Sends now work.")
@@ -396,12 +380,14 @@ class Controller:
     def detach_local(self):
         """
         Local-only detach: drop mgmt proxy but don't tell daemon to forget us.
+        Also disable RX so callbacks become no-ops while detached.
         """
         if not self.is_attached:
             return False, "Detach skipped: not attached."
         def do_detach():
             self.log("Detaching locally (closing mgmt proxy; keeping node_path)")
             self.mgmt = None
+            self._rx_enabled = False   # <--- gate callbacks while 'detached'
         return self._safe_call(do_detach, "Detach(local)")
 
     def leave_network(self, deep: bool = False):
@@ -419,6 +405,7 @@ class Controller:
             clear_token()
             self.mgmt = None
             self.node_path = None
+            self._rx_enabled = False
             self.log("Leave: OK (daemon node removed; local token cleared)")
 
         ok, msg = self._safe_call(do_leave, "Leave")
@@ -434,11 +421,7 @@ class Controller:
 
     def purge_local_node(self):
         """
-        Nuclear option:
-          - stop meshd via systemd DBus
-          - pkexec rm -rf /var/lib/bluetooth/mesh/<uuid>
-          - start meshd
-          - wipe local token / node_path cache
+        Nuclear option.
         """
         uuid_hex = self._current_uuid_hex()
         if not uuid_hex:
@@ -453,7 +436,6 @@ class Controller:
         ok, msg = self._pkexec_run(["rm", "-rf", f"/var/lib/bluetooth/mesh/{uuid_hex}"])
         self.log(f"Purge: rm dir -> {msg}")
         if not ok:
-            # try to restart anyway so we don't leave daemon down
             self._systemd_start_meshd()
             return False, f"Purge: failed to delete node dir ({msg})"
 
@@ -481,8 +463,25 @@ class Controller:
                     os.remove(NODE_UUID_FILE)
                 except Exception:
                     pass
+            try:
+                (LOG_DIR / "mesh_app.log").unlink(missing_ok=True)
+            except TypeError:
+                import os
+                try:
+                    os.remove(str(LOG_DIR / "mesh_app.log"))
+                except Exception:
+                    pass
+            try:
+                (LOG_DIR / "mesh_devkey.log").unlink(missing_ok=True)
+            except TypeError:
+                import os
+                try:
+                    os.remove(str(LOG_DIR / "mesh_devkey.log"))
+                except Exception:
+                    pass
             self.mgmt = None
             self.node_path = None
+            self._rx_enabled = False
         except Exception as e:
             self.log(f"Purge: local cleanup warning: {e}")
 
@@ -510,7 +509,6 @@ class Controller:
     def provision_uuid(self, uuid_hex: str):
         """
         Start PB-ADV provisioning for a beaconing (unprovisioned) UUID.
-        We no longer cancel the scan before calling AddNode.
         """
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
@@ -547,7 +545,6 @@ class Controller:
         """
         Tell the newly provisioned node:
         "Install AppKey(app_index) of NetKey(net_index)."
-        Under the hood this is Config AppKey Add.
         """
         def do():
             self.mgmt.AddAppKey(
@@ -581,9 +578,8 @@ class Controller:
 
     def _bind_local_client_sig(self, local_elem_addr: int, app_index: int, model_id: int):
         # Bind LOCAL Generic OnOff Client (0x1001) to AppKey(0) on local primary elem 0x0001
-        local_unicast = 0x0001  # Provisioner primary; query if needed via get_local_unicast()
+        local_unicast = 0x0001
         try:
-            # Positional: target=local_unicast, elem_addr, app_index, model_id
             ok, msg = self.cfg_bind_model_sig(local_unicast, local_elem_addr, app_index, model_id)
             return ok, msg
         except Exception as e:
@@ -594,7 +590,7 @@ class Controller:
         Config Model App Bind (opcode 0x803D) for SIG models.
         """
         buf = bytearray()
-        buf += bytes([0x80, 0x3D])  # opcode: Config Model App Bind
+        buf += bytes([0x80, 0x3D])  # opcode
         buf += int(elem_addr).to_bytes(2, "little")
         buf += int(app_index).to_bytes(2, "little")  # AppKeyIndex (12-bit real index)
         buf += int(model_id).to_bytes(2, "little")   # SIG model id (0x1000)
@@ -613,16 +609,6 @@ class Controller:
     ) -> bytes:
         """
         Build Config Model Publication Set (opcode 0x03) payload.
-
-        Layout per spec:
-          0:      0x03
-          1-2:    element_addr   (LE)
-          3-4:    publish_addr   (LE)
-          5-6:    AppKeyIndex (12 bits) | CredFlag (1 bit)  (LE)
-          7:      ttl
-          8:      period byte (pub period: (res<<6)|steps)
-          9:      retransmit
-          10-11:  model_id (SIG model -> 2 bytes LE)
         """
         field = ((app_index & 0x0FFF) | ((1 if cred_flag else 0) << 12))
 
@@ -657,19 +643,12 @@ class Controller:
         app_index: int,
         model_id: int,
         ttl: int = 7,
-        period: int = 0x45,         # <-- 0x45 means ~5s period (RES=1s, steps=5)
+        period: int = 0x45,         # ~5s
         retransmit: int = 0x00,
         cred_flag: bool = False,
     ):
         """
-        Ask the remote node to publish GenericOnOffStatus periodically to pub_addr
-        using AppKey app_index.
-
-        dest_unicast: address of the *remote* node we just provisioned
-        elem_addr:    its element address (usually same as dest_unicast)
-        pub_addr:     who it should publish to (we use our provisioner addr 0x0001)
-        model_id:     SIG model ID (0x1000 = Generic OnOff Server)
-        period:       publish period byte. 0x45 => every ~5 seconds.
+        Ask the remote node to publish GenericOnOffStatus periodically to pub_addr.
         """
         payload = self._encode_model_pub_set(
             elem_addr,
@@ -750,7 +729,7 @@ class Controller:
                 "unicast": int(unicast),
                 "elements": int(elements),
                 "primary_elem": int(unicast),
-                "model_id": "0x1000",   # we're managing Generic OnOff Server
+                "model_id": "0x1000",
                 "app_idx": 0,
                 "provisioned_at": entry.get("provisioned_at", now_iso),
                 "last_seen": entry.get("last_seen", None),
@@ -765,8 +744,7 @@ class Controller:
 
     def _mark_node_stage(self, uuid_hex: str, stage: str, extra: Dict[str, Any] | None = None):
         """
-        Update node's 'state' field in nodes.json to reflect where we are
-        (appkey_ok, bind_ok, pub_ok, etc) and bump last_seen timestamp.
+        Update node's 'state' and bump last_seen.
         """
         try:
             db = load_nodes_db()
@@ -804,8 +782,7 @@ class Controller:
 
     def _fsm_send_pubset(self, unicast: int):
         """
-        Step 3 of provisioning FSM:
-        tell the node to periodically publish GenericOnOffStatus back to us.
+        Step 3 of provisioning FSM.
         """
         job = self._provision_jobs.get(unicast)
         if not job or not self.mgmt:
@@ -814,10 +791,7 @@ class Controller:
         elem_addr = job["elem_addr"]
         model_id  = job["model_id"]
         app_idx   = job["app_idx"]
-
-        # our own primary element is 0x0001, so tell the new node
-        # "publish your GenericOnOffStatus to 0x0001"
-        pub_addr    = 0x0001
+        pub_addr  = 0x0001
 
         ok_pub, msg_pub = self.cfg_pub_set_sig(
             dest_unicast=unicast,
@@ -826,7 +800,7 @@ class Controller:
             app_index=app_idx,
             model_id=model_id,
             ttl=7,
-            period=0x45,        # <-- IMPORTANT: nonzero, ~5s period
+            period=0x45,
             retransmit=0x00,
             cred_flag=False,
         )
@@ -862,30 +836,17 @@ class Controller:
             status = data[2] if len(data) > 2 else None
             return f"ModelPubStatus status=0x{status:02x}" if status is not None else "ModelPubStatus <short>"
 
+        # ---- NEW: 0x804A Node Reset Status
+        if op0 == 0x80 and op1 == 0x4A:
+            return "NodeResetStatus"
+
         return f"unknown opcode {data[0:2].hex()}"
 
     def _handle_config_status_from_node(self, src_unicast: int, data: bytes):
         """
         Advance the provisioning FSM based on config status PDUs from the node.
-
-        We care about three opcodes:
-
-        - 0x8003: Config AppKey Status
-            -> means the node accepted AppKey(0)
-            -> next step: Bind AppKey(0) to Generic OnOff Server (0x1000)
-
-        - 0x803E: Config Model App Status
-            -> means the Bind succeeded
-            -> next step: set Publication so it publishes GenericOnOffStatus to us
-
-        - 0x8019: Config Model Publication Status
-            -> means PubSet succeeded
-            -> provisioning DONE 🎉
-            -> ask node for its current GenericOnOff state immediately
         """
         job = self._provision_jobs.get(src_unicast)
-        if not job:
-            return  # not a node we're actively provisioning
 
         if len(data) < 2:
             return
@@ -894,75 +855,64 @@ class Controller:
 
         # 0x8003 = Config AppKey Status
         if op0 == 0x80 and op1 == 0x03:
-            if len(data) >= 3:
+            if job and len(data) >= 3:
                 status = data[2]
                 if status == 0x00:
-                    # AppKey Add accepted
-                    self.log(
-                        f"[FSM] got AppKeyStatus OK from 0x{src_unicast:04x} -> send Bind next"
-                    )
+                    self.log(f"[FSM] got AppKeyStatus OK from 0x{src_unicast:04x} -> send Bind next")
                     job["stage"] = "appkey_ok"
-
-                    # reflect in nodes.json
                     self._mark_node_stage(job["uuid"], "appkey_ok")
-
-                    # kick off Bind
                     self._fsm_send_bind(src_unicast)
-                else:
-                    self.log(
-                        f"[FSM] AppKeyStatus FAIL (0x{status:02x}) from 0x{src_unicast:04x}"
-                    )
             return
 
-        # 0x803E = Config Model App Status (Bind result for SIG model)
+        # 0x803E = Config Model App Status (Bind)
         if op0 == 0x80 and op1 == 0x3E:
-            if len(data) >= 3:
+            if job and len(data) >= 3:
                 status = data[2]
                 if status == 0x00:
-                    self.log(
-                        f"[FSM] got Bind OK from 0x{src_unicast:04x} -> send PubSet next"
-                    )
+                    self.log(f"[FSM] got Bind OK from 0x{src_unicast:04x} -> send PubSet next")
                     job["stage"] = "bind_ok"
-
-                    # reflect in nodes.json
                     self._mark_node_stage(job["uuid"], "bind_ok")
-
-                    # tell node to publish GenericOnOffStatus to us
                     self._fsm_send_pubset(src_unicast)
-                else:
-                    self.log(
-                        f"[FSM] Bind FAIL (0x{status:02x}) from 0x{src_unicast:04x}"
-                    )
             return
 
-        # 0x8019 = Config Model Publication Status (PubSet result)
+        # 0x8019 = Config Model Publication Status (PubSet)
         if op0 == 0x80 and op1 == 0x19:
-            if len(data) >= 3:
+            if job and len(data) >= 3:
                 status = data[2]
                 if status == 0x00:
-                    self.log(
-                        f"[FSM] got PubSet OK from 0x{src_unicast:04x} -> provisioning DONE 🎉"
-                    )
+                    self.log(f"[FSM] got PubSet OK from 0x{src_unicast:04x} -> provisioning DONE 🎉")
                     job["stage"] = "done"
-
-                    # mark node fully active / publishing
                     self._mark_node_stage(job["uuid"], "pub_ok")
-
-                    # actively poll the node right now for its state,
-                    # so we don't have to sit around waiting for its periodic publish.
                     ok_get, msg_get = self.send_onoff_get(src_unicast, app_idx=0)
                     if ok_get:
-                        self.log(
-                            f"[FSM] sent GenericOnOffGet to 0x{src_unicast:04x}, waiting for Status…"
-                        )
+                        self.log(f"[FSM] sent GenericOnOffGet to 0x{src_unicast:04x}, waiting for Status…")
                     else:
-                        self.log(
-                            f"[FSM] failed to send GenericOnOffGet to 0x{src_unicast:04x}: {msg_get}"
-                        )
-                else:
-                    self.log(
-                        f"[FSM] PubSet FAIL (0x{status:02x}) from 0x{src_unicast:04x}"
-                    )
+                        self.log(f"[FSM] failed to send GenericOnOffGet to 0x{src_unicast:04x}: {msg_get}")
+            return
+
+        # ---- NEW: 0x804A = Node Reset Status (ack for 0x8049)
+        if op0 == 0x80 and op1 == 0x4A:
+            self.log(f"[Reset] Node 0x{src_unicast:04x} acknowledged reset (0x804A). Marking reset_ok.")
+            try:
+                db = load_nodes_db()
+                now_iso = datetime.now(timezone.utc).isoformat()
+                for uuid_hex, entry in list(db.items()):
+                    if int(entry.get("unicast", -1)) == src_unicast:
+                        entry["state"] = "reset_ok"
+                        entry["last_seen"] = now_iso
+                        # optional: clear last_onoff after reset
+                        entry.pop("last_onoff", None)
+                        db[uuid_hex] = entry
+                        break
+                save_nodes_db(db)
+            except Exception as e:
+                self.log(f"[Reset] failed to update nodes.json: {e}")
+
+            # clean up any pending FSM job for this node
+            try:
+                self._provision_jobs.pop(src_unicast, None)
+            except Exception:
+                pass
             return
 
     # ---------------- callbacks from bluetooth-meshd ----------------
@@ -1015,13 +965,7 @@ class Controller:
 
     def on_add_node_complete(self, uuid_bytes: bytes, unicast: int, count: int):
         """
-        bluetooth-meshd Provisioner1.AddNodeComplete callback.
-        Node has just been provisioned via PB-ADV.
-        We'll:
-          - stash FSM job
-          - save nodes.json state='provisioning'
-          - create (or confirm) AppKey(0)
-          - send Config AppKey Add to the node
+        Provisioner1.AddNodeComplete callback.
         """
         uuid_hex = uuid_bytes.hex()
         self.log(
@@ -1042,10 +986,7 @@ class Controller:
         self._persist_node_basic(uuid_hex, unicast, count)
 
         def _kickoff_cfg():
-            # Ensure we have AppKey(0) locally
             self._ensure_appkey(app_index=0, net_index=0)
-
-            # Push that AppKey down to the node (Config AppKey Add)
             ok, msg = self.add_appkey_to_node(
                 unicast,
                 app_index=0,
@@ -1055,9 +996,6 @@ class Controller:
             if ok:
                 self.log(f"[FSM] AppKey Add sent to 0x{unicast:04x}")
                 self._provision_jobs[unicast]["stage"] = "appkey_sent"
-                # After this, we expect a DevKey message:
-                #   opcode 0x8003 (AppKey Status)
-                # which will trigger _fsm_send_bind.
             else:
                 self.log(f"[FSM] AppKey Add FAILED to 0x{unicast:04x}: {msg}")
         try:
@@ -1075,6 +1013,10 @@ class Controller:
         Element1.MessageReceived: application-layer (AppKey-encrypted) msg.
         We'll specifically interpret GenericOnOffStatus (0x82 0x04).
         """
+        # ---- NEW: gate messages while "detached" locally ----
+        if not self._rx_enabled:
+            return
+
         try:
             info = "unknown"
             last_onoff_val = None
@@ -1112,8 +1054,12 @@ class Controller:
     def on_element_devkey_message(self, source: int, remote: bool, net_index: int, data: bytes):
         """
         Element1.DevKeyMessageReceived: config/status messages encrypted with DevKey.
-        This is where nodes answer AppKey Add / Bind / PubSet.
+        This is where nodes answer AppKey Add / Bind / PubSet / Reset.
         """
+        # ---- NEW: gate messages while "detached" locally ----
+        if not self._rx_enabled:
+            return
+
         try:
             decoded = self._decode_config_status(data)
             line = (
@@ -1125,7 +1071,7 @@ class Controller:
         except Exception as e:
             self.log(f"[Element0] DevKeyMessageReceived error: {e}")
 
-        # drive the provisioning FSM forward
+        # drive the provisioning FSM forward (+ reset ack)
         try:
             self._handle_config_status_from_node(source, data)
         except Exception as e:
@@ -1135,27 +1081,21 @@ class Controller:
         """
         Ask a node for its Generic OnOff state (Generic OnOff Get, opcode 0x8201).
         We send this over AppKey 'app_idx' (we always use 0 so far).
-
-        That node should answer with GenericOnOffStatus (opcode 0x8204),
-        which will arrive via on_element_message(), which writes mesh_app.log
-        and updates nodes.json last_onoff/last_seen.
         """
         if not self.is_attached:
             raise RuntimeError("Not attached yet")
 
-        # Generic OnOff Get opcode = 0x82 0x01 (2-byte SIG opcode)
         payload = bytes([0x82, 0x01])
 
         self.log(f"[debug] sending GenericOnOff Get -> 0x{dest_unicast:04x}")
 
-        # FIXED: Use Element0 proxy + explicit path
         try:
             return self._safe_call(
                 lambda: self.mgmt.Send(
-                    ELEM0_PATH,  # Our app's Element0 path
+                    ELEM0_PATH,
                     int(dest_unicast),
                     int(app_idx),
-                    {},           # options dict: we'll keep empty for now
+                    {},
                     payload,
                 ),
                 f"OnOffGet(0x{dest_unicast:04x})"
