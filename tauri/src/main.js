@@ -137,7 +137,8 @@ function extractState(info){
 const STATE_INFO = {
   // terminal + admin
   "pub_ok":        { label: "Provisioned",      prio: 90, cls: "ok" },       // final success
-  "reset_sent":    { label: "Reset Sent",       prio: 10, cls: "muted", hide: true }, // UI: hidden
+  "reset_sent":    { label: "Reset Sent",       prio: 10, cls: "muted" },
+  "reset_ok":      { label: "Reset",            prio: 0,  cls: "muted", hide: true }, // UI: hidden
 
   // provisioning (descending importance)
   "pub_sent":      { label: "Publish Sent",     prio: 85, cls: "info" },
