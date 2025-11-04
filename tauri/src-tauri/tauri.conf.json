@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "",
     "beforeBuildCommand": "",
-    "frontendDist": "../"
+    "frontendDist": "../src"
   },
 
   "app": {
@@ -25,6 +25,10 @@
   "bundle": {
     "active": true,
     "targets": ["deb"],
+    "resources":[
+      "../../vesp/**",
+      "../../run_gui.py"
+    ],
     "linux": {
       "deb": {
         "depends": [
