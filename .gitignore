@@ -1,0 +1,40 @@
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# --- Logs (we don’t ship runtime logs) ---
+*.log
+
+# --- Node / Frontend (keep lockfile tracked) ---
+/tauri/node_modules/
+
+# --- Tauri / Rust build outputs ---
+/tauri/src-tauri/target/
+/tauri/src-tauri/gen/          # generated permissions/manifests
+# Bundles live under target/bundle; covered by target/, but listed for clarity:
+#/tauri/src-tauri/target/release/bundle/
+#/tauri/src-tauri/target/debug/
+
+# --- Nix convenience outputs ---
+/result
+/result-*
+/.nix-*
+
+# --- Env / secrets (if you add any) ---
+.env
+.env.*
+
