@@ -246,7 +246,7 @@ function renderScanList(){
   });
 }
 
-// New: render from nodes.json DB with filter & sort; otherwise fall back to scans.
+// Render strictly from nodes.json; the Scan panel shows unprovisioned beacons.
 function renderNodesDash() {
   const body = $("#nodes-body"); if (!body) return;
   const stick = nearBottom(body);
@@ -259,7 +259,7 @@ function renderNodesDash() {
     // Build normalized rows for sorting/filtering
     let rows = dbEntries.map(([uuid, info]) => {
       const uuidClean = cleanUuid(uuid);
-      const isLocal = uuidClean === "cae";
+      const isLocal = !!(info && typeof info === "object" && info.is_local === true);
       const name = getNodeName(uuidClean);
 
       // read 'state' directly (includes provisioning states from controller.py)
@@ -272,7 +272,6 @@ function renderNodesDash() {
       // unicast
       const unicastRaw = (info && typeof info === "object" && info.unicast != null) ? info.unicast : "";
       let unicastHex = toHexUnicast(unicastRaw);
-      if (isLocal) unicastHex = "0001";
 
       // more fields
       const elements = formatElements(info?.elements);
@@ -457,61 +456,13 @@ function renderNodesDash() {
       body.appendChild(row);
     }
   } else {
-    // Fallback: legacy “scan-only” rows
-    const entries = [...scanMap.entries()].sort((a,b)=> b[1]-a[1]);
-    for (const [uuid, rssi] of entries) {
+    // Empty state (nodes.json has no entries)
+    const body = $("#nodes-body");
+    if (body) {
+      body.innerHTML = "";
       const row = document.createElement("div");
-      row.className = "nodes-row";
-
-      const nameCol = document.createElement("div");
-      nameCol.className = "col name cell";
-      const view = document.createElement("div");
-      view.className = "name-view";
-      view.textContent = getNodeName(uuid);
-      nameCol.appendChild(view);
-
-      view.addEventListener("click", () => {
-        const edit = document.createElement("input");
-        edit.className = "name-edit";
-        edit.value = getNodeName(uuid);
-        nameCol.replaceChild(edit, view);
-        edit.focus(); edit.select();
-
-        let done = false;
-        const commit = async () => {
-          if (done) return;
-          done = true;
-          const val = edit.value;
-          await saveNodeName(uuid, val);
-          view.textContent = getNodeName(uuid);
-          nameCol.replaceChild(view, edit);
-          push("app", `[UI] name saved for ${uuid}: "${val || uuid}"`);
-        };
-        const cancel = () => {
-          if (done) return;
-          done = true;
-          nameCol.replaceChild(view, edit);
-        };
-        edit.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") { e.preventDefault(); commit(); }
-          else if (e.key === "Escape") { e.preventDefault(); cancel(); }
-        });
-        edit.addEventListener("blur", commit);
-      });
-
-      const stateCol = document.createElement("div"); stateCol.className = "col state cell"; stateCol.textContent = "";
-      const elemCol  = document.createElement("div"); elemCol.className  = "col elements cell right"; elemCol.textContent  = "";
-      const modelCol = document.createElement("div"); modelCol.className = "col model cell"; modelCol.textContent = "";
-      const lastCol  = document.createElement("div"); lastCol.className  = "col last_onoff cell"; lastCol.textContent  = "";
-      const uuidCol  = document.createElement("div"); uuidCol.className  = "col uuid cell mono"; uuidCol.textContent  = cleanUuid(uuid);
-      const uniCol   = document.createElement("div"); uniCol.className   = "col unicast cell mono"; uniCol.textContent   = `RSSI ${String(rssi)}`;
-      const actCol   = document.createElement("div"); actCol.className   = "col actions cell right";
-      const btnReset = document.createElement("button"); btnReset.className = "btn warn"; btnReset.textContent = "Reset"; btnReset.disabled = true;
-      actCol.appendChild(btnReset);
-
-      row.appendChild(nameCol); row.appendChild(stateCol); row.appendChild(elemCol);
-      row.appendChild(modelCol); row.appendChild(lastCol); row.appendChild(uuidCol);
-      row.appendChild(uniCol);   row.appendChild(actCol);
+      row.className = "nodes-empty";
+      row.textContent = "No nodes yet — use the Scan panel to find devices and provision them.";
       body.appendChild(row);
     }
   }

@@ -32,6 +32,9 @@ class Controller:
     """
 
     def __init__(self):
+
+        self._dbus_lock = threading.RLock()
+        
         # the UUID we just tried to create/join with (for JoinComplete)
         self._pending_uuid: bytes | None = None
 
@@ -89,8 +92,14 @@ class Controller:
         except Exception:
             pass
 
-        # ---- NEW: receive-gating to make "detach" actually silent ----
+        # ---- receive-gating to make "detach" actually silent ----
         self._rx_enabled: bool = True  # enabled after attach, disabled on detach
+
+        # ---- runtime state guards ----
+        self._scan_active: bool = False              # track UnprovisionedScan state
+        self._prov_active_uuid: Optional[str] = None # UUID currently being provisioned (single-flight)
+        self._prov_timeout_src: Optional[int] = None # GLib timeout source id for AddNode
+
 
     # ---------------- internal helpers ----------------
 
@@ -386,6 +395,7 @@ class Controller:
             return False, "Detach skipped: not attached."
         def do_detach():
             self.log("Detaching locally (closing mgmt proxy; keeping node_path)")
+            self._provisioning_cancel("detached")
             self.mgmt = None
             self._rx_enabled = False   # <--- gate callbacks while 'detached'
         return self._safe_call(do_detach, "Detach(local)")
@@ -503,16 +513,25 @@ class Controller:
             self.log(f"UnprovisionedScan({s}s)")
         else:
             self.log("UnprovisionedScan({})")
-        return self._safe_call(lambda: self.mgmt.UnprovisionedScan(opts), "UnprovisionedScan")
+        ok, msg = self._safe_call(lambda: self.mgmt.UnprovisionedScan(opts), "UnprovisionedScan")
+        if ok:
+            self._scan_active = True
+        return ok, msg
 
     def scan_stop(self):
-        if self.mgmt:
+        if self.mgmt and self._scan_active:
             self.log("UnprovisionedScanCancel()")
-            return self._safe_call(lambda: self.mgmt.UnprovisionedScanCancel(), "UnprovisionedScanCancel")
+            ok, msg = self._safe_call(lambda: self.mgmt.UnprovisionedScanCancel(), "UnprovisionedScanCancel")
+            if ok:
+                self._scan_active = False
+            return ok, msg
+        return True, "UnprovisionedScanCancel : already stopped"
+            
 
     def provision_uuid(self, uuid_hex: str):
         """
         Start PB-ADV provisioning for a beaconing (unprovisioned) UUID.
+        Enforces single-flight and deduplicates.
         """
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
@@ -521,16 +540,39 @@ class Controller:
         if len(uh) != 32 or any(c not in "0123456789abcdef" for c in uh):
             raise ValueError("UUID must be 16 bytes (32 hex chars)")
 
+        # If we're already provisioning *anything*, don't start another.
+        if self._provisioning_busy():
+            busy = self._prov_active_uuid
+            if (not self._rx_enabled) or (busy == uh):
+                self.log(f"[Provision] clearing stale/same-uuid busy flag (busy={busy}, req={uh})")
+                self._provisioning_cancel("stale/same-uuid retry")
+            else:
+                self.log(f"[Provision] already in progress for {busy}; ignoring request for {uh}")
+                return False, f"Provision busy: {busy}"
+
+        # If nodes.json already has this UUID, refuse (already provisioned/known).
+        if self._db_is_final_pub_ok(uh):
+            self.log(f"[Provision] UUID {uh} already provisioned (pub_ok); skipping AddNode")
+            return False, "Already provisioned (pub_ok)"
+
+        # Stop scan only if actually running.
         try:
-            self.scan_stop()
+            if self._scan_active:
+                self.scan_stop()
         except Exception as e:
             self.log(f"Scan-cancel (pre-AddNode) non-fatal: {e}")
 
+        self._provisioning_begin(uh, timeout_sec=45)
         self.log(f"AddNode({uh})")
-        return self._safe_call(
+        ok, msg = self._safe_call(
             lambda: self.mgmt.AddNode(bytes.fromhex(uh), {}),
             "AddNode"
         )
+        if not ok:
+            # AddNode submission itself failed; clear busy flag now.
+            self._provisioning_end_if(uh)
+        return ok, msg
+
 
     # ---------------- Config Client helpers ----------------
 
@@ -723,6 +765,36 @@ class Controller:
         return ok, msg
 
     # ---------------- provisioning FSM + nodes.json helpers ----------------
+
+    def _provisioning_cancel(self, reason: str = "cancelled"):
+        """
+        Clear the single-flight gate and its timer. Try to cancel anything in meshd.
+        Safe to call if nothing is active.
+        """
+        uuid = self._prov_active_uuid
+        self._prov_active_uuid = None
+        try:
+            if self._prov_timeout_src is not None:
+                GLib.source_remove(self._prov_timeout_src)
+        except Exception:
+            pass
+        self._prov_timeout_src = None
+
+        # Best-effort: stop scans; attempt a Cancel() if daemon supports it.
+        try:
+            if self._scan_active:
+                self.scan_stop()
+        except Exception:
+            pass
+        try:
+            # Some bluez/mesh builds expose a cancel; harmless if missing
+            if self.mgmt and hasattr(self.mgmt, "Cancel"):
+                self.mgmt.Cancel({})
+        except Exception:
+            pass
+
+        if uuid:
+            self.log(f"[Provision] canceled in-flight job for {uuid} ({reason})")
 
     def _persist_node_basic(self, uuid_hex: str, unicast: int, elements: int):
         """
@@ -924,6 +996,63 @@ class Controller:
                 pass
             return
 
+    def _db_state_for_uuid(self, uuid_hex: str) -> Optional[str]:
+        try:
+            db = load_nodes_db()
+            s = db.get(uuid_hex, {}).get("state")
+            if isinstance(s, dict):
+                s = s.get("value") or s.get("name") or s.get("state") or s.get("status")
+            return (str(s).strip().lower() if s else None)
+        except Exception:
+            return None
+
+    def _db_is_final_pub_ok(self, uuid_hex: str) -> bool:
+        return (self._db_state_for_uuid(uuid_hex) in ("pub_ok", "done"))
+
+    def _provisioning_busy(self) -> bool:
+        return self._prov_active_uuid is not None
+
+    def _provisioning_begin(self, uuid_hex: str, timeout_sec: int = 45):
+        self._prov_active_uuid = uuid_hex
+
+        # Arm a timeout in case the daemon never calls AddNode{Complete,Failed}
+        try:
+            if self._prov_timeout_src is not None:
+                GLib.source_remove(self._prov_timeout_src)
+                self._prov_timeout_src = None
+        except Exception:
+            pass
+
+        def _on_timeout():
+            if self._prov_active_uuid == uuid_hex:
+                self.log(f"[Provision] timeout waiting for AddNodeComplete ({uuid_hex}); marking idle")
+                self._prov_active_uuid = None
+                self._prov_timeout_src = None
+                # optional: surface this to UI logs clearly
+                try:
+                    (LOG_DIR / "mesh_app.log").open("a", encoding="utf-8").write(
+                        f"[Provision] timeout for {uuid_hex}\n"
+                    )
+                except Exception:
+                    pass
+            return False
+        
+        try:
+            self._prov_timeout_src = GLib.timeout_add_seconds(int(timeout_sec), _on_timeout)
+        except Exception:
+            self._prov_timeout_src = None
+
+    def _provisioning_end_if(self, uuid_hex: str):
+        if self._prov_active_uuid == uuid_hex:
+            self._prov_active_uuid = None
+        try:
+            if self._prov_timeout_src is not None:
+                GLib.source_remove(self._prov_timeout_src)
+        except Exception:
+            pass
+        self._prov_timeout_src = None
+
+
     # ---------------- callbacks from bluetooth-meshd ----------------
 
     def on_join_complete(self, token: int):
@@ -976,11 +1105,17 @@ class Controller:
         """
         Provisioner1.AddNodeComplete callback.
         """
+        if not self._rx_enabled:
+            self.log("[FSM] ignoring AddNodeComplete while locally detached")
+            return
+        
         uuid_hex = uuid_bytes.hex()
         self.log(
             f"AddNodeComplete: uuid={uuid_hex} "
             f"unicast=0x{unicast:04x} elements={count}"
         )
+
+        self._provisioning_end_if(uuid_hex)
 
         # create/refresh FSM job
         self._provision_jobs[unicast] = {
@@ -1015,7 +1150,15 @@ class Controller:
         threading.Thread(target=_kickoff_cfg, daemon=True).start()
 
     def on_add_node_failed(self, uuid_bytes: bytes, reason: str):
-        self.log(f"AddNodeFailed: uuid={uuid_bytes.hex()} reason={reason}")
+        if not self._rx_enabled:
+            self.log("[FSM] ignoring AddNodeFailed while locally detached")
+            return
+        
+        uuid_hex = uuid_bytes.hex()
+        self.log(f"AddNodeFailed: uuid={uuid_hex} reason={reason}")
+        
+        self._provisioning_end_if(uuid_hex)
+
 
     def on_element_message(self, source: int, key_index: int, destination, data: bytes):
         """
@@ -1114,14 +1257,11 @@ class Controller:
             return False, f"OnOffGet proxy failed: {e}"
 
     # ---------------- utilities ----------------
-
+        
     def _safe_call(self, fn, label: str):
-        """
-        Wrap any D-Bus call in try/except and return (ok, msg)
-        so the GUI doesn't explode.
-        """
         try:
-            fn()
+            with self._dbus_lock:
+                fn()
             return True, f"{label}: OK"
         except Exception as e:
             emsg = e.args[0] if e.args else str(e)
