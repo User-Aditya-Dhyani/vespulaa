@@ -492,6 +492,10 @@ class Controller:
     def scan_start(self, seconds: Optional[int] = None):
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
+        try:
+            self.scan_stop()
+        except Exception:
+            pass
         opts: Dict[str, Any] = {}
         if seconds is not None:
             s = max(1, min(int(seconds), 600))
@@ -516,6 +520,11 @@ class Controller:
         uh = uuid_hex.replace("-", "").strip().lower()
         if len(uh) != 32 or any(c not in "0123456789abcdef" for c in uh):
             raise ValueError("UUID must be 16 bytes (32 hex chars)")
+
+        try:
+            self.scan_stop()
+        except Exception as e:
+            self.log(f"Scan-cancel (pre-AddNode) non-fatal: {e}")
 
         self.log(f"AddNode({uh})")
         return self._safe_call(
