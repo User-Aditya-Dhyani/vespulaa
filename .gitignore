@@ -26,8 +26,10 @@ __pycache__/
 /tauri/src-tauri/target/
 /tauri/src-tauri/gen/          # generated permissions/manifests
 # Bundles live under target/bundle; covered by target/, but listed for clarity:
-#/tauri/src-tauri/target/release/bundle/
-#/tauri/src-tauri/target/debug/
+/tauri/src-tauri/target/release/bundle/
+/tauri/src-tauri/target/debug/
+
+/tauri/src-tauri/resources/
 
 # --- Nix convenience outputs ---
 /result

@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use serde::{Serialize, Deserialize};
+use serde::Deserialize;
 use std::{
   io::{BufRead, BufReader, Write},
   sync::{Arc, Mutex},
@@ -21,10 +21,12 @@ enum PyMsg {
 }
 
 struct PyProc {
+  // Keep the whole child so it doesn't get dropped, and so we can wait() and log exit.
+  child: Arc<Mutex<std::process::Child>>,
   stdin: Arc<Mutex<std::process::ChildStdin>>,
 }
 
-// ---------- nodes.json location (same org/app as before) ----------
+// ---------- nodes.json location ----------
 fn nodes_db_path() -> PathBuf {
   let proj = ProjectDirs::from("org", "vespulaa", "Vespulaa")
     .expect("cannot resolve project dirs");
@@ -167,55 +169,72 @@ fn send_cmd(py: &PyProc, line: &str) -> Result<(), String> {
 // Spawn python bridge: we use vesp.tauri_bridge
 fn spawn_python(handle: tauri::AppHandle) -> Result<PyProc, Box<dyn std::error::Error>> {
   use std::path::{Path, PathBuf};
+  use std::process::{Command, Stdio};
 
-  fn looks_like_root(p: &Path) -> bool {
-    p.join("vesp").is_dir()
+  // 1) Try packaged locations inside the app resources dir.
+  let mut py_module_root: Option<PathBuf> = None;
+  if let Ok(res_root) = handle.path().resource_dir() {
+    let cand1 = res_root.join("vesp");
+    let cand2 = res_root.join("resources").join("vesp");
+    let _ = handle.emit("log:app", format!("[RUST] resource_dir={}", res_root.display()));
+    let _ = handle.emit("log:app", format!("[RUST] check {}", cand1.display()));
+    let _ = handle.emit("log:app", format!("[RUST] check {}", cand2.display()));
+    if cand1.is_dir() { py_module_root = Some(cand1); }
+    else if cand2.is_dir() { py_module_root = Some(cand2); }
   }
 
-  // gather candidate dirs to search for `vesp/`
-  let mut candidates: Vec<PathBuf> = Vec::new();
+  // 2) Dev fallback: walk up to find a folder that contains "vesp/"
+  if py_module_root.is_none() {
+    fn looks_like_root(p: &Path) -> bool { p.join("vesp").is_dir() }
+    let mut candidates: Vec<PathBuf> = Vec::new();
 
-  if let Ok(cwd) = std::env::current_dir() {
-    candidates.push(cwd.clone());
-    if let Some(p1) = cwd.parent() {
-      candidates.push(p1.to_path_buf());
-      if let Some(p2) = p1.parent() {
-        candidates.push(p2.to_path_buf());
+    if let Ok(cwd) = std::env::current_dir() {
+      candidates.push(cwd.clone());
+      if let Some(p1) = cwd.parent() {
+        candidates.push(p1.to_path_buf());
+        if let Some(p2) = p1.parent() {
+          candidates.push(p2.to_path_buf());
+        }
       }
     }
-  }
+    if let Ok(exe) = std::env::current_exe() {
+      if let Some(p0) = exe.parent().and_then(|d| d.parent()).and_then(|d| d.parent()) {
+        candidates.push(p0.to_path_buf());
+      }
+    }
 
-  if let Ok(exe) = std::env::current_exe() {
-    if let Some(p0) = exe.parent().and_then(|d| d.parent()).and_then(|d| d.parent()) {
-      candidates.push(p0.to_path_buf());
+    if let Some(dev_root) = candidates.into_iter().find(|p| looks_like_root(p)) {
+      py_module_root = Some(dev_root.join("vesp"));
     }
   }
 
-  // first dir that contains vesp/
-  let repo_root = candidates
-    .into_iter()
-    .find(|p| looks_like_root(p))
-    .ok_or_else(|| "Could not locate repo root containing 'vesp/'".to_string())?;
+  let py_root = py_module_root.ok_or("Could not locate Python package 'vesp'")?;
+  let py_parent = py_root.parent().ok_or("bad vesp path")?;
 
-  // run Python bridge from repo root with PYTHONPATH pointing at it
-  let mut cmd = std::process::Command::new("python3");
-  cmd.arg("-u").arg("-m").arg("vesp.tauri_bridge")
-     .stdin(std::process::Stdio::piped())
-     .stdout(std::process::Stdio::piped())
-     .stderr(std::process::Stdio::piped())
-     .current_dir(&repo_root);
+  let _ = handle.emit("log:app", format!("[RUST] using py_root={}", py_root.display()));
+  let _ = handle.emit("log:app", format!("[RUST] PYTHONPATH will include {}", py_parent.display()));
 
-  let new_pp = match std::env::var("PYTHONPATH") {
-    Ok(old) => format!("{}:{}", repo_root.display(), old),
-    Err(_)  => repo_root.display().to_string(),
-  };
-  cmd.env("PYTHONPATH", new_pp);
+  let mut cmd = Command::new("python3");
+  cmd.arg("-u")
+     .arg("-m").arg("vesp.tauri_bridge")
+     .env("PYTHONPATH", {
+        // prepend our module root to PYTHONPATH so `import vesp` works
+        let old = std::env::var("PYTHONPATH").unwrap_or_default();
+        if old.is_empty() { py_parent.display().to_string() }
+        else { format!("{}:{}", py_parent.display(), old) }
+     })
+     .current_dir(py_parent)
+     .stdin(Stdio::piped())
+     .stdout(Stdio::piped())
+     .stderr(Stdio::piped());
 
   let mut child = cmd.spawn()?;
 
-  let stdin = std::sync::Arc::new(std::sync::Mutex::new(child.stdin.take().expect("stdin")));
+  // Keep handles + spawn I/O threads
+  let stdin = Arc::new(Mutex::new(child.stdin.take().expect("stdin")));
   let stdout = child.stdout.take().expect("stdout");
   let stderr = child.stderr.take().expect("stderr");
+  let child_arc = Arc::new(Mutex::new(child));
 
   // stdout → frontend events
   {
@@ -241,6 +260,7 @@ fn spawn_python(handle: tauri::AppHandle) -> Result<PyProc, Box<dyn std::error::
           let _ = h.emit("log:python", line);
         }
       }
+      let _ = h.emit("log:app", "[PY] stdout closed");
     });
   }
 
@@ -252,10 +272,22 @@ fn spawn_python(handle: tauri::AppHandle) -> Result<PyProc, Box<dyn std::error::
       for line in reader.lines().flatten() {
         let _ = h.emit("log:python", format!("[stderr] {line}"));
       }
+      let _ = h.emit("log:app", "[PY] stderr closed");
     });
   }
 
-  Ok(PyProc { stdin })
+  // Waiter thread to log child exit status clearly
+  {
+    let h = handle.clone();
+    let child_for_wait = Arc::clone(&child_arc);
+    std::thread::spawn(move || {
+      let status = child_for_wait.lock().ok()
+        .and_then(|mut c| c.wait().ok());
+      let _ = h.emit("log:app", format!("[PY] exited with status {:?}", status));
+    });
+  }
+
+  Ok(PyProc { child: child_arc, stdin })
 }
 
 use std::{fs::File, io::{Seek, SeekFrom}, time::{Duration, SystemTime}};
