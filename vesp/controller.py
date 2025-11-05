@@ -100,6 +100,19 @@ class Controller:
         self._prov_active_uuid: Optional[str] = None # UUID currently being provisioned (single-flight)
         self._prov_timeout_src: Optional[int] = None # GLib timeout source id for AddNode
 
+        # ---- runtime state guards ----
+        self._scan_active: bool = False                  # track UnprovisionedScan state
+        self._prov_active_uuid: Optional[str] = None     # UUID currently being provisioned (single-flight)
+        self._prov_timeout_src: Optional[int] = None     # kept for compatibility, but unused by no-timeout flow
+
+        # NEW: queueing + scan resume + action guards
+        self._prov_queue: list[str] = []                 # FIFO queue of UUIDs
+        self._scan_should_resume: bool = False           # remember scan state while we provision
+
+        self._leave_in_progress: bool = False            # UI guard
+        self._purge_in_progress: bool = False            # UI guard
+
+        self._pkexec_warmed: bool = False
 
     # ---------------- internal helpers ----------------
 
@@ -133,6 +146,22 @@ class Controller:
         def do():
             self._systemd().StartUnit("bluetooth-meshd.service", "replace")
         return self._safe_call(do, "systemd StartUnit(bluetooth-meshd)")
+
+    def _pkexec_warmup(self) -> None:
+        """
+        Trigger a single polkit authorization prompt so subsequent pkexec calls
+        in this session are allowed without re-prompting (polkit caches auth).
+        We do NOT store any password ourselves.
+        """
+        if self._pkexec_warmed:
+            return
+        ok, msg = self._pkexec_run(["/bin/sh", "-c", "true"], timeout=30)
+        if ok:
+            self._pkexec_warmed = True
+            self.log("[pkexec] authorization warmed (polkit may cache for this session)")
+        else:
+            # Not fatal; purge/other calls will prompt again as needed
+            self.log(f"[pkexec] warmup did not complete: {msg}")
 
     def _pkexec_run(self, argv: list[str], timeout: int = 60) -> tuple[bool, str]:
         """
@@ -400,112 +429,155 @@ class Controller:
             self._rx_enabled = False   # <--- gate callbacks while 'detached'
         return self._safe_call(do_detach, "Detach(local)")
 
+
     def leave_network(self, deep: bool = False):
         """
         Tell bluetooth-meshd to delete our node (Leave(token)),
-        clear local token, and optionally restart the daemon.
+        clear local token, clear node_uuid.json, and drop local proxies.
+        NOTE: We do NOT restart bluetooth-meshd here. `deep` is ignored on purpose
+        to keep signature compatibility with callers.
         """
-        tok = load_token()
-        if tok is None:
-            return False, "Leave skipped: no token found (nothing to forget)"
+        if getattr(self, "_leave_in_progress", False):
+            return False, "Leave already in progress"
+        self._leave_in_progress = True
+        try:
+            tok = load_token()
+            if tok is None:
+                return False, "Leave skipped: no token found (nothing to forget)"
 
-        def do_leave():
-            self.log(f"Leave({tok})")
-            self._get_mesh().Leave(int(tok))
-            clear_token()
-            self.mgmt = None
-            self.node_path = None
-            self._rx_enabled = False
-            self.log("Leave: OK (daemon node removed; local token cleared)")
+            def do_leave():
+                self.log(f"Leave({tok})")
+                self._get_mesh().Leave(int(tok))
+                clear_token()
+                # also clear persisted node UUID file if present
+                try:
+                    from .util import NODE_UUID_FILE
+                    try:
+                        NODE_UUID_FILE.unlink(missing_ok=True)
+                    except TypeError:
+                        import os
+                        try:
+                            os.remove(NODE_UUID_FILE)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.log(f"Leave: failed to clear node_uuid.json: {e}")
 
-        ok, msg = self._safe_call(do_leave, "Leave")
-        if not ok or not deep:
-            return ok, msg
+                self.mgmt = None
+                self.node_path = None
+                self._rx_enabled = False
+                self.log("Leave: OK (daemon node removed; local token and node_uuid cleared)")
 
-        ok2, msg2 = self._systemd_restart_meshd()
-        if ok2:
-            return True, "Leave: OK (daemon restarted)"
-        else:
-            self.log("Run manually:\n  sudo systemctl restart bluetooth-meshd")
-            return True, "Leave: node removed; restart daemon manually (see log)"
+            return self._safe_call(do_leave, "Leave")
+        finally:
+            self._leave_in_progress = False
 
     def purge_local_node(self):
         """
         Nuclear option.
+        - Does NOT store any password. We 'warm up' polkit once so subsequent pkexec
+          calls are usually non-interactive during this app session (polkit caches).
+        - Stops meshd, removes node dir, starts meshd, clears local artifacts.
         """
-        uuid_hex = self._current_uuid_hex()
-        if not uuid_hex:
-            return False, "Purge: no local UUID found (nothing to delete)"
-
-        self.log(f"Purge: target UUID={uuid_hex}")
-
-        ok, msg = self._systemd_stop_meshd()
-        if not ok:
-            return False, f"Purge: failed to stop meshd ({msg})"
-
-        ok, msg = self._pkexec_run(["rm", "-rf", f"/var/lib/bluetooth/mesh/{uuid_hex}"])
-        self.log(f"Purge: rm dir -> {msg}")
-        if not ok:
-            self._systemd_start_meshd()
-            return False, f"Purge: failed to delete node dir ({msg})"
-
-        ok, msg = self._systemd_start_meshd()
-        if not ok:
-            return False, f"Purge: meshd failed to start ({msg})"
-
-        # local cleanup
+        if getattr(self, "_purge_in_progress", False):
+            return False, "Purge already in progress"
+        self._purge_in_progress = True
         try:
-            clear_token()
-            from .util import NODE_UUID_FILE, NODES_FILE
-            try:
-                NODES_FILE.unlink(missing_ok=True)
-            except TypeError:
-                import os
-                try:
-                    os.remove(NODES_FILE)
-                except Exception:
-                    pass
-            try:
-                NODE_UUID_FILE.unlink(missing_ok=True)
-            except TypeError:
-                import os
-                try:
-                    os.remove(NODE_UUID_FILE)
-                except Exception:
-                    pass
-            try:
-                (LOG_DIR / "mesh_app.log").unlink(missing_ok=True)
-            except TypeError:
-                import os
-                try:
-                    os.remove(str(LOG_DIR / "mesh_app.log"))
-                except Exception:
-                    pass
-            try:
-                (LOG_DIR / "mesh_devkey.log").unlink(missing_ok=True)
-            except TypeError:
-                import os
-                try:
-                    os.remove(str(LOG_DIR / "mesh_devkey.log"))
-                except Exception:
-                    pass
-            self.mgmt = None
-            self.node_path = None
-            self._rx_enabled = False
-        except Exception as e:
-            self.log(f"Purge: local cleanup warning: {e}")
+            uuid_hex = self._current_uuid_hex()
+            if not uuid_hex:
+                return False, "Purge: no local UUID found (nothing to delete)"
 
-        return True, "Purge: OK (node dir removed; meshd restarted)"
+            self.log(f"Purge: target UUID={uuid_hex}")
+
+            # Warm up polkit so subsequent pkexec calls don't re-prompt this session.
+            try:
+                self._pkexec_warmup()
+            except Exception:
+                pass  # non-fatal
+
+            ok, msg = self._systemd_stop_meshd()
+            if not ok:
+                return False, f"Purge: failed to stop meshd ({msg})"
+
+            ok, msg = self._pkexec_run(["rm", "-rf", f"/var/lib/bluetooth/mesh/{uuid_hex}"])
+            self.log(f"Purge: rm dir -> {msg}")
+            if not ok:
+                self._systemd_start_meshd()
+                return False, f"Purge: failed to delete node dir ({msg})"
+
+            ok, msg = self._systemd_start_meshd()
+            if not ok:
+                return False, f"Purge: meshd failed to start ({msg})"
+
+            # local cleanup
+            try:
+                clear_token()
+                from .util import NODE_UUID_FILE, NODES_FILE
+                try:
+                    NODES_FILE.unlink(missing_ok=True)
+                except TypeError:
+                    import os
+                    try:
+                        os.remove(NODES_FILE)
+                    except Exception:
+                        pass
+                try:
+                    NODE_UUID_FILE.unlink(missing_ok=True)
+                except TypeError:
+                    import os
+                    try:
+                        os.remove(NODE_UUID_FILE)
+                    except Exception:
+                        pass
+                try:
+                    (LOG_DIR / "mesh_app.log").unlink(missing_ok=True)
+                except TypeError:
+                    import os
+                    try:
+                        os.remove(str(LOG_DIR / "mesh_app.log"))
+                    except Exception:
+                        pass
+                try:
+                    (LOG_DIR / "mesh_devkey.log").unlink(missing_ok=True)
+                except TypeError:
+                    import os
+                    try:
+                        os.remove(str(LOG_DIR / "mesh_devkey.log"))
+                    except Exception:
+                        pass
+                self.mgmt = None
+                self.node_path = None
+                self._rx_enabled = False
+            except Exception as e:
+                self.log(f"Purge: local cleanup warning: {e}")
+
+            return True, "Purge: OK (node dir removed; meshd restarted)"
+        finally:
+            self._purge_in_progress = False
 
     # ---------------- scan / provision ----------------
-
     def scan_start(self, seconds: Optional[int] = None):
+        """
+        Start UnprovisionedScan only if not currently provisioning.
+        Never auto-restart; UI decides when to start again.
+        """
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
+
+        # Hard guard: don't scan while AddNode is in-flight.
+        if self._prov_active_uuid:
+            return False, f"UnprovisionedScan: blocked (provisioning {self._prov_active_uuid} is in progress)"
+
+        # If a scan is already active, say so (idempotent UX).
+        if self._scan_active:
+            return True, "UnprovisionedScan: already running"
+
+        # Always stop any stray scan first (defensive; no-op if not started).
         try:
             self.scan_stop()
         except Exception:
             pass
+
         opts: Dict[str, Any] = {}
         if seconds is not None:
             s = max(1, min(int(seconds), 600))
@@ -513,25 +585,33 @@ class Controller:
             self.log(f"UnprovisionedScan({s}s)")
         else:
             self.log("UnprovisionedScan({})")
+
         ok, msg = self._safe_call(lambda: self.mgmt.UnprovisionedScan(opts), "UnprovisionedScan")
         if ok:
             self._scan_active = True
         return ok, msg
 
+
     def scan_stop(self):
+        """
+        Stop scan if running; idempotent.
+        """
         if self.mgmt and self._scan_active:
             self.log("UnprovisionedScanCancel()")
             ok, msg = self._safe_call(lambda: self.mgmt.UnprovisionedScanCancel(), "UnprovisionedScanCancel")
             if ok:
                 self._scan_active = False
             return ok, msg
-        return True, "UnprovisionedScanCancel : already stopped"
-            
+        return True, "UnprovisionedScanCancel: already stopped"
+
 
     def provision_uuid(self, uuid_hex: str):
         """
-        Start PB-ADV provisioning for a beaconing (unprovisioned) UUID.
-        Enforces single-flight and deduplicates.
+        PB-ADV provisioning for a beaconing (unprovisioned) UUID.
+        - Strict single-flight (one AddNode at a time).
+        - Dedupe exact same UUID requests while in-flight.
+        - No app-side timeout; rely on meshd producing AddNode{Complete,Failed}.
+        - Do NOT auto-restart scanning afterwards (UI controls scanning).
         """
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
@@ -540,38 +620,40 @@ class Controller:
         if len(uh) != 32 or any(c not in "0123456789abcdef" for c in uh):
             raise ValueError("UUID must be 16 bytes (32 hex chars)")
 
-        # If we're already provisioning *anything*, don't start another.
-        if self._provisioning_busy():
-            busy = self._prov_active_uuid
-            if (not self._rx_enabled) or (busy == uh):
-                self.log(f"[Provision] clearing stale/same-uuid busy flag (busy={busy}, req={uh})")
-                self._provisioning_cancel("stale/same-uuid retry")
-            else:
-                self.log(f"[Provision] already in progress for {busy}; ignoring request for {uh}")
-                return False, f"Provision busy: {busy}"
-
-        # If nodes.json already has this UUID, refuse (already provisioned/known).
+        # If nodes.json already says the device is done, refuse.
         if self._db_is_final_pub_ok(uh):
             self.log(f"[Provision] UUID {uh} already provisioned (pub_ok); skipping AddNode")
             return False, "Already provisioned (pub_ok)"
 
-        # Stop scan only if actually running.
-        try:
-            if self._scan_active:
-                self.scan_stop()
-        except Exception as e:
-            self.log(f"Scan-cancel (pre-AddNode) non-fatal: {e}")
+        # Single-flight guard
+        if self._prov_active_uuid:
+            if self._prov_active_uuid == uh:
+                self.log(f"[Provision] {uh} already in progress; ignoring duplicate request")
+                return False, f"Provision already in progress: {uh}"
+            else:
+                self.log(f"[Provision] busy with {self._prov_active_uuid}; ignoring request for {uh}")
+                return False, f"Provision busy: {self._prov_active_uuid}"
 
-        self._provisioning_begin(uh, timeout_sec=45)
+        # Stop scan if running — provisioning and scanning must not overlap.
+        if self._scan_active:
+            try:
+                self.scan_stop()
+            except Exception as e:
+                self.log(f"Scan-cancel (pre-AddNode) non-fatal: {e}")
+
+        # Mark active (no timer; let meshd drive completion/failure)
+        self._prov_active_uuid = uh
+
         self.log(f"AddNode({uh})")
-        ok, msg = self._safe_call(
-            lambda: self.mgmt.AddNode(bytes.fromhex(uh), {}),
-            "AddNode"
-        )
+        ok, msg = self._safe_call(lambda: self.mgmt.AddNode(bytes.fromhex(uh), {}), "AddNode")
         if not ok:
-            # AddNode submission itself failed; clear busy flag now.
-            self._provisioning_end_if(uh)
+            # Submission failed synchronously -> clear busy flag.
+            if self._prov_active_uuid == uh:
+                self._prov_active_uuid = None
+            return ok, msg
         return ok, msg
+
+
 
 
     # ---------------- Config Client helpers ----------------
@@ -768,11 +850,12 @@ class Controller:
 
     def _provisioning_cancel(self, reason: str = "cancelled"):
         """
-        Clear the single-flight gate and its timer. Try to cancel anything in meshd.
-        Safe to call if nothing is active.
+        Best-effort cancel for explicit user actions (e.g., detach).
+        We do NOT call this for duplicate provision_uuid anymore.
         """
         uuid = self._prov_active_uuid
         self._prov_active_uuid = None
+
         try:
             if self._prov_timeout_src is not None:
                 GLib.source_remove(self._prov_timeout_src)
@@ -780,14 +863,12 @@ class Controller:
             pass
         self._prov_timeout_src = None
 
-        # Best-effort: stop scans; attempt a Cancel() if daemon supports it.
         try:
             if self._scan_active:
                 self.scan_stop()
         except Exception:
             pass
         try:
-            # Some bluez/mesh builds expose a cancel; harmless if missing
             if self.mgmt and hasattr(self.mgmt, "Cancel"):
                 self.mgmt.Cancel({})
         except Exception:
@@ -795,6 +876,7 @@ class Controller:
 
         if uuid:
             self.log(f"[Provision] canceled in-flight job for {uuid} ({reason})")
+
 
     def _persist_node_basic(self, uuid_hex: str, unicast: int, elements: int):
         """
@@ -1012,35 +1094,16 @@ class Controller:
     def _provisioning_busy(self) -> bool:
         return self._prov_active_uuid is not None
 
-    def _provisioning_begin(self, uuid_hex: str, timeout_sec: int = 45):
+    def _provisioning_begin(self, uuid_hex: str, timeout_sec: int = 0):
+        # kept for compatibility with callers; we just set the active UUID now
         self._prov_active_uuid = uuid_hex
-
-        # Arm a timeout in case the daemon never calls AddNode{Complete,Failed}
+        # no timers in no-timeout mode
         try:
             if self._prov_timeout_src is not None:
                 GLib.source_remove(self._prov_timeout_src)
-                self._prov_timeout_src = None
         except Exception:
             pass
-
-        def _on_timeout():
-            if self._prov_active_uuid == uuid_hex:
-                self.log(f"[Provision] timeout waiting for AddNodeComplete ({uuid_hex}); marking idle")
-                self._prov_active_uuid = None
-                self._prov_timeout_src = None
-                # optional: surface this to UI logs clearly
-                try:
-                    (LOG_DIR / "mesh_app.log").open("a", encoding="utf-8").write(
-                        f"[Provision] timeout for {uuid_hex}\n"
-                    )
-                except Exception:
-                    pass
-            return False
-        
-        try:
-            self._prov_timeout_src = GLib.timeout_add_seconds(int(timeout_sec), _on_timeout)
-        except Exception:
-            self._prov_timeout_src = None
+        self._prov_timeout_src = None
 
     def _provisioning_end_if(self, uuid_hex: str):
         if self._prov_active_uuid == uuid_hex:
@@ -1051,6 +1114,30 @@ class Controller:
         except Exception:
             pass
         self._prov_timeout_src = None
+
+
+    def _provisioning_start_next_if_any(self):
+        if self._prov_active_uuid is None and self._prov_queue:
+            nxt = self._prov_queue.pop(0)
+            self.log(f"[Provision] starting queued UUID {nxt}")
+            # go through public path for the same checks
+            try:
+                self.provision_uuid(nxt)
+            except Exception as e:
+                self.log(f"[Provision] failed to start queued {nxt}: {e}")
+                # try the next one if this entry was bad
+                self._provisioning_start_next_if_any()
+
+    def _resume_scan_if_needed(self):
+        # resume only if we paused it for provisioning
+        if self._scan_should_resume:
+            self._scan_should_resume = False
+            try:
+                ok, msg = self.scan_start()
+                if not ok:
+                    self.log(f"[Scan] resume failed: {msg}")
+            except Exception as e:
+                self.log(f"[Scan] resume exception: {e}")
 
 
     # ---------------- callbacks from bluetooth-meshd ----------------
@@ -1101,63 +1188,76 @@ class Controller:
         self.log(f"Alloc unicast: 0x{start:04x}..+{count-1}")
         return start
 
+    # ---------------- callbacks from bluetooth-meshd ----------------
+
     def on_add_node_complete(self, uuid_bytes: bytes, unicast: int, count: int):
         """
         Provisioner1.AddNodeComplete callback.
+        - Clears single-flight busy flag.
+        - Does NOT auto-restart scanning.
         """
         if not self._rx_enabled:
             self.log("[FSM] ignoring AddNodeComplete while locally detached")
             return
-        
+
         uuid_hex = uuid_bytes.hex()
-        self.log(
-            f"AddNodeComplete: uuid={uuid_hex} "
-            f"unicast=0x{unicast:04x} elements={count}"
-        )
+        self.log(f"AddNodeComplete: uuid={uuid_hex} unicast=0x{unicast:04x} elements={count}")
 
-        self._provisioning_end_if(uuid_hex)
+        # Clear busy flag if this was our in-flight UUID.
+        if self._prov_active_uuid == uuid_hex:
+            self._prov_active_uuid = None
 
-        # create/refresh FSM job
+        # Create/refresh FSM job
         self._provision_jobs[unicast] = {
             "uuid": uuid_hex,
             "stage": "provisioning",
-            "model_id": 0x1000,    # Generic OnOff Server
-            "app_idx": 0,          # AppKey(0)
-            "elem_addr": unicast,  # element 0
+            "model_id": 0x1000,   # Generic OnOff Server
+            "app_idx": 0,         # AppKey(0)
+            "elem_addr": unicast, # element 0
         }
 
-        # make/update nodes.json
+        # Persist basics
         self._persist_node_basic(uuid_hex, unicast, count)
 
+        # Kick off config steps (AppKey Add) in a thread
         def _kickoff_cfg():
             self._ensure_appkey(app_index=0, net_index=0)
-            ok, msg = self.add_appkey_to_node(
-                unicast,
-                app_index=0,
-                net_index=0,
-                update=False
-            )
+            ok, msg = self.add_appkey_to_node(unicast, app_index=0, net_index=0, update=False)
             if ok:
                 self.log(f"[FSM] AppKey Add sent to 0x{unicast:04x}")
                 self._provision_jobs[unicast]["stage"] = "appkey_sent"
             else:
                 self.log(f"[FSM] AppKey Add FAILED to 0x{unicast:04x}: {msg}")
+
+        # Best-effort: ensure scanning is stopped (may already be)
         try:
-            self.log("[FSM] stopping scan (UnprovisionedScanCancel)")
-            self.mgmt.UnprovisionedScanCancel()
+            if self._scan_active:
+                self.mgmt.UnprovisionedScanCancel()
+                self._scan_active = False
+                self.log("[FSM] ensured scan stopped after AddNodeComplete")
         except Exception as e:
-            self.log(f"[FSM] scan-cancel failed (non-fatal): {e}")
+            self.log(f"[FSM] scan-cancel post-complete non-fatal: {e}")
+
         threading.Thread(target=_kickoff_cfg, daemon=True).start()
 
+
     def on_add_node_failed(self, uuid_bytes: bytes, reason: str):
+        """
+        Provisioner1.AddNodeFailed callback.
+        - Clears single-flight busy flag.
+        - Does NOT auto-restart scanning.
+        """
         if not self._rx_enabled:
             self.log("[FSM] ignoring AddNodeFailed while locally detached")
             return
-        
+
         uuid_hex = uuid_bytes.hex()
         self.log(f"AddNodeFailed: uuid={uuid_hex} reason={reason}")
-        
-        self._provisioning_end_if(uuid_hex)
+
+        if self._prov_active_uuid == uuid_hex:
+            self._prov_active_uuid = None
+
+        # Leave scan state unchanged — UI decides whether to scan again.
 
 
     def on_element_message(self, source: int, key_index: int, destination, data: bytes):
