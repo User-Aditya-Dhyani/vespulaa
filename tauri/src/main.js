@@ -259,7 +259,10 @@ function renderNodesDash() {
     // Build normalized rows for sorting/filtering
     let rows = dbEntries.map(([uuid, info]) => {
       const uuidClean = cleanUuid(uuid);
-      const isLocal = !!(info && typeof info === "object" && info.is_local === true);
+      const isLocal =
+        (info && info.is_local === true) ||
+        uuidClean.length !== 32 ||
+        uuidClean === "cae";
       const name = getNodeName(uuidClean);
 
       // read 'state' directly (includes provisioning states from controller.py)

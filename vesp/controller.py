@@ -490,10 +490,10 @@ class Controller:
             self.log(f"Purge: target UUID={uuid_hex}")
 
             # Warm up polkit so subsequent pkexec calls don't re-prompt this session.
-            try:
-                self._pkexec_warmup()
-            except Exception:
-                pass  # non-fatal
+            #try:
+            #    self._pkexec_warmup()
+            #except Exception:
+            #    pass  # non-fatal
 
             ok, msg = self._systemd_stop_meshd()
             if not ok:
@@ -569,8 +569,8 @@ class Controller:
             return False, f"UnprovisionedScan: blocked (provisioning {self._prov_active_uuid} is in progress)"
 
         # If a scan is already active, say so (idempotent UX).
-        if self._scan_active:
-            return True, "UnprovisionedScan: already running"
+##        if self._scan_active:
+##            return True, "UnprovisionedScan: already running"
 
         # Always stop any stray scan first (defensive; no-op if not started).
         try:
@@ -596,7 +596,7 @@ class Controller:
         """
         Stop scan if running; idempotent.
         """
-        if self.mgmt and self._scan_active:
+        if self.mgmt:
             self.log("UnprovisionedScanCancel()")
             ok, msg = self._safe_call(lambda: self.mgmt.UnprovisionedScanCancel(), "UnprovisionedScanCancel")
             if ok:
@@ -635,11 +635,11 @@ class Controller:
                 return False, f"Provision busy: {self._prov_active_uuid}"
 
         # Stop scan if running — provisioning and scanning must not overlap.
-        if self._scan_active:
-            try:
-                self.scan_stop()
-            except Exception as e:
-                self.log(f"Scan-cancel (pre-AddNode) non-fatal: {e}")
+##        if self._scan_active:
+##            try:
+##                self.scan_stop()
+##            except Exception as e:
+##                self.log(f"Scan-cancel (pre-AddNode) non-fatal: {e}")
 
         # Mark active (no timer; let meshd drive completion/failure)
         self._prov_active_uuid = uh
