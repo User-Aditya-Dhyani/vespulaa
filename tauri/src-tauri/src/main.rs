@@ -38,12 +38,39 @@ fn nodes_db_path() -> PathBuf {
 // ---------- Read/write helpers for nodes.json ----------
 fn read_nodes_value() -> Result<serde_json::Value, String> {
   let p = nodes_db_path();
+
+  // If missing, create an empty JSON object and return it.
+  if !p.exists() {
+    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    fs::write(&p, b"{}\n").map_err(|e| format!("create nodes.json failed: {e}"))?;
+    return Ok(serde_json::json!({}));
+  }
+
+  // If present but empty, normalize to {}.
   let s = fs::read_to_string(&p).map_err(|e| format!("read nodes.json failed: {e}"))?;
-  serde_json::from_str::<serde_json::Value>(&s).map_err(|e| format!("parse nodes.json failed: {e}"))
+  if s.trim().is_empty() {
+    fs::write(&p, b"{}\n").map_err(|e| format!("normalize nodes.json failed: {e}"))?;
+    return Ok(serde_json::json!({}));
+  }
+
+  // Try to parse; if corrupt, back up and recreate as {} to keep the app usable.
+  match serde_json::from_str::<serde_json::Value>(&s) {
+    Ok(v) => Ok(v),
+    Err(parse_err) => {
+      let backup = p.with_extension("json.bak");
+      let _ = fs::rename(&p, &backup);
+      let _ = fs::write(&p, b"{}\n");
+      Err(format!(
+        "parse nodes.json failed: {parse_err}. Backed up to {} and recreated a fresh file.",
+        backup.display()
+      ))
+    }
+  }
 }
 
 fn write_nodes_value(v: &serde_json::Value) -> Result<(), String> {
   let p = nodes_db_path();
+  if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
   let s = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
   fs::write(&p, s).map_err(|e| format!("write nodes.json failed: {e}"))
 }
