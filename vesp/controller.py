@@ -32,6 +32,9 @@ class Controller:
     """
 
     def __init__(self):
+
+        self._dbus_lock = threading.RLock()
+        
         # the UUID we just tried to create/join with (for JoinComplete)
         self._pending_uuid: bytes | None = None
 
@@ -60,52 +63,56 @@ class Controller:
         self._scan_cb: Callable[[str, int], None] = lambda uuid_hex, rssi: None
 
         # ---------- persistent unicast allocator ----------
-        # read nodes.json and find the highest "end" address we've used;
-        # bump from there so we don't reuse 0x0005 every run
         db = load_nodes_db()
         max_used = 0x0004
         for info in db.values():
             try:
                 base = int(info.get("unicast", 0))
                 elems = int(info.get("elements", 1))
-                end = base + elems  # first free addr after that node's block
+                end = base + elems
                 if end > max_used:
                     max_used = end
             except Exception:
                 pass
 
-        # propose a safe floor well above our own element address.
-        # 0x0010 worked for you. You could even pick 0x0100 if you want to be extra.
         floor_start = 0x0010
-
         nxt = max_used + 1
         if nxt < floor_start:
             nxt = floor_start
-
         self._next_unicast = nxt
-        # now alloc_unicast() will hand out >= 0x0010 every time
-
 
         # GLib main loop for async callbacks from meshd
         self._glib_loop: Optional[GLib.MainLoop] = None
 
-        # our provisioning FSM state for each fresh node
-        # key = unicast int, val = dict:
-        # {
-        #    "uuid": "<hex uuid>",
-        #    "stage": "provisioning" | "appkey_sent" | "appkey_ok"
-        #             | "bind_sent" | "bind_ok"
-        #             | "pub_sent"  | "done",
-        #    "model_id": 0x1000,     # Generic OnOff Server
-        #    "app_idx": 0,           # AppKey index we use
-        #    "elem_addr": <unicast>, # primary element address
-        # }
+        # provisioning FSM state
         self._provision_jobs: Dict[int, Dict[str, Any]] = {}
         try:
             (LOG_DIR / "mesh_app.log").touch(exist_ok=True)
             (LOG_DIR / "mesh_devkey.log").touch(exist_ok=True)
         except Exception:
             pass
+
+        # ---- receive-gating to make "detach" actually silent ----
+        self._rx_enabled: bool = True  # enabled after attach, disabled on detach
+
+        # ---- runtime state guards ----
+        self._scan_active: bool = False              # track UnprovisionedScan state
+        self._prov_active_uuid: Optional[str] = None # UUID currently being provisioned (single-flight)
+        self._prov_timeout_src: Optional[int] = None # GLib timeout source id for AddNode
+
+        # ---- runtime state guards ----
+        self._scan_active: bool = False                  # track UnprovisionedScan state
+        self._prov_active_uuid: Optional[str] = None     # UUID currently being provisioned (single-flight)
+        self._prov_timeout_src: Optional[int] = None     # kept for compatibility, but unused by no-timeout flow
+
+        # NEW: queueing + scan resume + action guards
+        self._prov_queue: list[str] = []                 # FIFO queue of UUIDs
+        self._scan_should_resume: bool = False           # remember scan state while we provision
+
+        self._leave_in_progress: bool = False            # UI guard
+        self._purge_in_progress: bool = False            # UI guard
+
+        self._pkexec_warmed: bool = False
 
     # ---------------- internal helpers ----------------
 
@@ -139,6 +146,22 @@ class Controller:
         def do():
             self._systemd().StartUnit("bluetooth-meshd.service", "replace")
         return self._safe_call(do, "systemd StartUnit(bluetooth-meshd)")
+
+    def _pkexec_warmup(self) -> None:
+        """
+        Trigger a single polkit authorization prompt so subsequent pkexec calls
+        in this session are allowed without re-prompting (polkit caches auth).
+        We do NOT store any password ourselves.
+        """
+        if self._pkexec_warmed:
+            return
+        ok, msg = self._pkexec_run(["/bin/sh", "-c", "true"], timeout=30)
+        if ok:
+            self._pkexec_warmed = True
+            self.log("[pkexec] authorization warmed (polkit may cache for this session)")
+        else:
+            # Not fatal; purge/other calls will prompt again as needed
+            self.log(f"[pkexec] warmup did not complete: {msg}")
 
     def _pkexec_run(self, argv: list[str], timeout: int = 60) -> tuple[bool, str]:
         """
@@ -338,14 +361,15 @@ class Controller:
                 node, _cfg = self._get_mesh().Attach(APP_ROOT, int(tok))
                 self.node_path = str(node)
                 self.mgmt = self.bus.get(MESH_BUS, self.node_path)
+                self._rx_enabled = True  # <--- enable RX on successful attach
                 self.log(f"Attached. Node path: {self.node_path}")
             except Exception as e:
                 emsg = e.args[0] if e.args else str(e)
                 if ("org.bluez.mesh.Error.AlreadyExists" in emsg or
                     "org.bluez.mesh.Error.Busy" in emsg):
-                    # already attached -> just grab proxy
                     if self.node_path:
                         self.mgmt = self.bus.get(MESH_BUS, self.node_path)
+                        self._rx_enabled = True
                         self.log("Attach: daemon reports already attached; rebound mgmt proxy.")
                     else:
                         raise
@@ -372,7 +396,6 @@ class Controller:
         app_idx = 0
         model_id = 0x1001
 
-        # Check if done (persist flag in nodes.json)
         db = load_nodes_db()
         if db.get("local_provisioner", {}).get("appkey_bound", False):
             return True, "Local client already configured (skipped)"
@@ -387,7 +410,6 @@ class Controller:
         if not ok_bind:
             return False, f"Local Bind FAILED: {msg_bind}"
 
-        # Flag as done in nodes.json
         db["local_provisioner"] = {"appkey_bound": True, "configured_at": datetime.now(timezone.utc).isoformat()}
         save_nodes_db(db)
         self.log("[LocalConfig] Local client configured! OnOff Sends now work.")
@@ -396,103 +418,166 @@ class Controller:
     def detach_local(self):
         """
         Local-only detach: drop mgmt proxy but don't tell daemon to forget us.
+        Also disable RX so callbacks become no-ops while detached.
         """
         if not self.is_attached:
             return False, "Detach skipped: not attached."
         def do_detach():
             self.log("Detaching locally (closing mgmt proxy; keeping node_path)")
+            self._provisioning_cancel("detached")
             self.mgmt = None
+            self._rx_enabled = False   # <--- gate callbacks while 'detached'
         return self._safe_call(do_detach, "Detach(local)")
+
 
     def leave_network(self, deep: bool = False):
         """
         Tell bluetooth-meshd to delete our node (Leave(token)),
-        clear local token, and optionally restart the daemon.
+        clear local token, clear node_uuid.json, and drop local proxies.
+        NOTE: We do NOT restart bluetooth-meshd here. `deep` is ignored on purpose
+        to keep signature compatibility with callers.
         """
-        tok = load_token()
-        if tok is None:
-            return False, "Leave skipped: no token found (nothing to forget)"
+        if getattr(self, "_leave_in_progress", False):
+            return False, "Leave already in progress"
+        self._leave_in_progress = True
+        try:
+            tok = load_token()
+            if tok is None:
+                return False, "Leave skipped: no token found (nothing to forget)"
 
-        def do_leave():
-            self.log(f"Leave({tok})")
-            self._get_mesh().Leave(int(tok))
-            clear_token()
-            self.mgmt = None
-            self.node_path = None
-            self.log("Leave: OK (daemon node removed; local token cleared)")
+            def do_leave():
+                self.log(f"Leave({tok})")
+                self._get_mesh().Leave(int(tok))
+                clear_token()
+                # also clear persisted node UUID file if present
+                try:
+                    from .util import NODE_UUID_FILE
+                    try:
+                        NODE_UUID_FILE.unlink(missing_ok=True)
+                    except TypeError:
+                        import os
+                        try:
+                            os.remove(NODE_UUID_FILE)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.log(f"Leave: failed to clear node_uuid.json: {e}")
 
-        ok, msg = self._safe_call(do_leave, "Leave")
-        if not ok or not deep:
-            return ok, msg
+                self.mgmt = None
+                self.node_path = None
+                self._rx_enabled = False
+                self.log("Leave: OK (daemon node removed; local token and node_uuid cleared)")
 
-        ok2, msg2 = self._systemd_restart_meshd()
-        if ok2:
-            return True, "Leave: OK (daemon restarted)"
-        else:
-            self.log("Run manually:\n  sudo systemctl restart bluetooth-meshd")
-            return True, "Leave: node removed; restart daemon manually (see log)"
+            return self._safe_call(do_leave, "Leave")
+        finally:
+            self._leave_in_progress = False
 
     def purge_local_node(self):
         """
-        Nuclear option:
-          - stop meshd via systemd DBus
-          - pkexec rm -rf /var/lib/bluetooth/mesh/<uuid>
-          - start meshd
-          - wipe local token / node_path cache
+        Nuclear option.
+        - Does NOT store any password. We 'warm up' polkit once so subsequent pkexec
+          calls are usually non-interactive during this app session (polkit caches).
+        - Stops meshd, removes node dir, starts meshd, clears local artifacts.
         """
-        uuid_hex = self._current_uuid_hex()
-        if not uuid_hex:
-            return False, "Purge: no local UUID found (nothing to delete)"
-
-        self.log(f"Purge: target UUID={uuid_hex}")
-
-        ok, msg = self._systemd_stop_meshd()
-        if not ok:
-            return False, f"Purge: failed to stop meshd ({msg})"
-
-        ok, msg = self._pkexec_run(["rm", "-rf", f"/var/lib/bluetooth/mesh/{uuid_hex}"])
-        self.log(f"Purge: rm dir -> {msg}")
-        if not ok:
-            # try to restart anyway so we don't leave daemon down
-            self._systemd_start_meshd()
-            return False, f"Purge: failed to delete node dir ({msg})"
-
-        ok, msg = self._systemd_start_meshd()
-        if not ok:
-            return False, f"Purge: meshd failed to start ({msg})"
-
-        # local cleanup
+        if getattr(self, "_purge_in_progress", False):
+            return False, "Purge already in progress"
+        self._purge_in_progress = True
         try:
-            clear_token()
-            from .util import NODE_UUID_FILE, NODES_FILE
-            try:
-                NODES_FILE.unlink(missing_ok=True)
-            except TypeError:
-                import os
-                try:
-                    os.remove(NODES_FILE)
-                except Exception:
-                    pass
-            try:
-                NODE_UUID_FILE.unlink(missing_ok=True)
-            except TypeError:
-                import os
-                try:
-                    os.remove(NODE_UUID_FILE)
-                except Exception:
-                    pass
-            self.mgmt = None
-            self.node_path = None
-        except Exception as e:
-            self.log(f"Purge: local cleanup warning: {e}")
+            uuid_hex = self._current_uuid_hex()
+            if not uuid_hex:
+                return False, "Purge: no local UUID found (nothing to delete)"
 
-        return True, "Purge: OK (node dir removed; meshd restarted)"
+            self.log(f"Purge: target UUID={uuid_hex}")
+
+            # Warm up polkit so subsequent pkexec calls don't re-prompt this session.
+            #try:
+            #    self._pkexec_warmup()
+            #except Exception:
+            #    pass  # non-fatal
+
+            ok, msg = self._systemd_stop_meshd()
+            if not ok:
+                return False, f"Purge: failed to stop meshd ({msg})"
+
+            ok, msg = self._pkexec_run(["rm", "-rf", f"/var/lib/bluetooth/mesh/{uuid_hex}"])
+            self.log(f"Purge: rm dir -> {msg}")
+            if not ok:
+                self._systemd_start_meshd()
+                return False, f"Purge: failed to delete node dir ({msg})"
+
+            ok, msg = self._systemd_start_meshd()
+            if not ok:
+                return False, f"Purge: meshd failed to start ({msg})"
+
+            # local cleanup
+            try:
+                clear_token()
+                from .util import NODE_UUID_FILE, NODES_FILE
+                try:
+                    NODES_FILE.unlink(missing_ok=True)
+                except TypeError:
+                    import os
+                    try:
+                        os.remove(NODES_FILE)
+                    except Exception:
+                        pass
+                try:
+                    NODE_UUID_FILE.unlink(missing_ok=True)
+                except TypeError:
+                    import os
+                    try:
+                        os.remove(NODE_UUID_FILE)
+                    except Exception:
+                        pass
+                try:
+                    (LOG_DIR / "mesh_app.log").unlink(missing_ok=True)
+                except TypeError:
+                    import os
+                    try:
+                        os.remove(str(LOG_DIR / "mesh_app.log"))
+                    except Exception:
+                        pass
+                try:
+                    (LOG_DIR / "mesh_devkey.log").unlink(missing_ok=True)
+                except TypeError:
+                    import os
+                    try:
+                        os.remove(str(LOG_DIR / "mesh_devkey.log"))
+                    except Exception:
+                        pass
+                self.mgmt = None
+                self.node_path = None
+                self._rx_enabled = False
+            except Exception as e:
+                self.log(f"Purge: local cleanup warning: {e}")
+
+            return True, "Purge: OK (node dir removed; meshd restarted)"
+        finally:
+            self._purge_in_progress = False
 
     # ---------------- scan / provision ----------------
-
     def scan_start(self, seconds: Optional[int] = None):
+        """
+        Start UnprovisionedScan only if not currently provisioning.
+        Never auto-restart; UI decides when to start again.
+        """
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
+
+        # Hard guard: don't scan while AddNode is in-flight.
+        if self._prov_active_uuid:
+            return False, f"UnprovisionedScan: blocked (provisioning {self._prov_active_uuid} is in progress)"
+
+        # If a scan is already active, say so (idempotent UX).
+##        if self._scan_active:
+##            return True, "UnprovisionedScan: already running"
+
+        # Always stop any stray scan first (defensive; no-op if not started).
+        try:
+            self.scan_stop()
+        except Exception:
+            pass
+
         opts: Dict[str, Any] = {}
         if seconds is not None:
             s = max(1, min(int(seconds), 600))
@@ -500,17 +585,33 @@ class Controller:
             self.log(f"UnprovisionedScan({s}s)")
         else:
             self.log("UnprovisionedScan({})")
-        return self._safe_call(lambda: self.mgmt.UnprovisionedScan(opts), "UnprovisionedScan")
+
+        ok, msg = self._safe_call(lambda: self.mgmt.UnprovisionedScan(opts), "UnprovisionedScan")
+        if ok:
+            self._scan_active = True
+        return ok, msg
+
 
     def scan_stop(self):
+        """
+        Stop scan if running; idempotent.
+        """
         if self.mgmt:
             self.log("UnprovisionedScanCancel()")
-            return self._safe_call(lambda: self.mgmt.UnprovisionedScanCancel(), "UnprovisionedScanCancel")
+            ok, msg = self._safe_call(lambda: self.mgmt.UnprovisionedScanCancel(), "UnprovisionedScanCancel")
+            if ok:
+                self._scan_active = False
+            return ok, msg
+        return True, "UnprovisionedScanCancel: already stopped"
+
 
     def provision_uuid(self, uuid_hex: str):
         """
-        Start PB-ADV provisioning for a beaconing (unprovisioned) UUID.
-        We no longer cancel the scan before calling AddNode.
+        PB-ADV provisioning for a beaconing (unprovisioned) UUID.
+        - Strict single-flight (one AddNode at a time).
+        - Dedupe exact same UUID requests while in-flight.
+        - No app-side timeout; rely on meshd producing AddNode{Complete,Failed}.
+        - Do NOT auto-restart scanning afterwards (UI controls scanning).
         """
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
@@ -519,11 +620,41 @@ class Controller:
         if len(uh) != 32 or any(c not in "0123456789abcdef" for c in uh):
             raise ValueError("UUID must be 16 bytes (32 hex chars)")
 
+        # If nodes.json already says the device is done, refuse.
+        if self._db_is_final_pub_ok(uh):
+            self.log(f"[Provision] UUID {uh} already provisioned (pub_ok); skipping AddNode")
+            return False, "Already provisioned (pub_ok)"
+
+        # Single-flight guard
+        if self._prov_active_uuid:
+            if self._prov_active_uuid == uh:
+                self.log(f"[Provision] {uh} already in progress; ignoring duplicate request")
+                return False, f"Provision already in progress: {uh}"
+            else:
+                self.log(f"[Provision] busy with {self._prov_active_uuid}; ignoring request for {uh}")
+                return False, f"Provision busy: {self._prov_active_uuid}"
+
+        # Stop scan if running — provisioning and scanning must not overlap.
+##        if self._scan_active:
+##            try:
+##                self.scan_stop()
+##            except Exception as e:
+##                self.log(f"Scan-cancel (pre-AddNode) non-fatal: {e}")
+
+        # Mark active (no timer; let meshd drive completion/failure)
+        self._prov_active_uuid = uh
+
         self.log(f"AddNode({uh})")
-        return self._safe_call(
-            lambda: self.mgmt.AddNode(bytes.fromhex(uh), {}),
-            "AddNode"
-        )
+        ok, msg = self._safe_call(lambda: self.mgmt.AddNode(bytes.fromhex(uh), {}), "AddNode")
+        if not ok:
+            # Submission failed synchronously -> clear busy flag.
+            if self._prov_active_uuid == uh:
+                self._prov_active_uuid = None
+            return ok, msg
+        return ok, msg
+
+
+
 
     # ---------------- Config Client helpers ----------------
 
@@ -547,7 +678,6 @@ class Controller:
         """
         Tell the newly provisioned node:
         "Install AppKey(app_index) of NetKey(net_index)."
-        Under the hood this is Config AppKey Add.
         """
         def do():
             self.mgmt.AddAppKey(
@@ -581,9 +711,8 @@ class Controller:
 
     def _bind_local_client_sig(self, local_elem_addr: int, app_index: int, model_id: int):
         # Bind LOCAL Generic OnOff Client (0x1001) to AppKey(0) on local primary elem 0x0001
-        local_unicast = 0x0001  # Provisioner primary; query if needed via get_local_unicast()
+        local_unicast = 0x0001
         try:
-            # Positional: target=local_unicast, elem_addr, app_index, model_id
             ok, msg = self.cfg_bind_model_sig(local_unicast, local_elem_addr, app_index, model_id)
             return ok, msg
         except Exception as e:
@@ -594,7 +723,7 @@ class Controller:
         Config Model App Bind (opcode 0x803D) for SIG models.
         """
         buf = bytearray()
-        buf += bytes([0x80, 0x3D])  # opcode: Config Model App Bind
+        buf += bytes([0x80, 0x3D])  # opcode
         buf += int(elem_addr).to_bytes(2, "little")
         buf += int(app_index).to_bytes(2, "little")  # AppKeyIndex (12-bit real index)
         buf += int(model_id).to_bytes(2, "little")   # SIG model id (0x1000)
@@ -613,16 +742,6 @@ class Controller:
     ) -> bytes:
         """
         Build Config Model Publication Set (opcode 0x03) payload.
-
-        Layout per spec:
-          0:      0x03
-          1-2:    element_addr   (LE)
-          3-4:    publish_addr   (LE)
-          5-6:    AppKeyIndex (12 bits) | CredFlag (1 bit)  (LE)
-          7:      ttl
-          8:      period byte (pub period: (res<<6)|steps)
-          9:      retransmit
-          10-11:  model_id (SIG model -> 2 bytes LE)
         """
         field = ((app_index & 0x0FFF) | ((1 if cred_flag else 0) << 12))
 
@@ -657,19 +776,12 @@ class Controller:
         app_index: int,
         model_id: int,
         ttl: int = 7,
-        period: int = 0x45,         # <-- 0x45 means ~5s period (RES=1s, steps=5)
+        period: int = 0x45,         # ~5s
         retransmit: int = 0x00,
         cred_flag: bool = False,
     ):
         """
-        Ask the remote node to publish GenericOnOffStatus periodically to pub_addr
-        using AppKey app_index.
-
-        dest_unicast: address of the *remote* node we just provisioned
-        elem_addr:    its element address (usually same as dest_unicast)
-        pub_addr:     who it should publish to (we use our provisioner addr 0x0001)
-        model_id:     SIG model ID (0x1000 = Generic OnOff Server)
-        period:       publish period byte. 0x45 => every ~5 seconds.
+        Ask the remote node to publish GenericOnOffStatus periodically to pub_addr.
         """
         payload = self._encode_model_pub_set(
             elem_addr,
@@ -736,6 +848,36 @@ class Controller:
 
     # ---------------- provisioning FSM + nodes.json helpers ----------------
 
+    def _provisioning_cancel(self, reason: str = "cancelled"):
+        """
+        Best-effort cancel for explicit user actions (e.g., detach).
+        We do NOT call this for duplicate provision_uuid anymore.
+        """
+        uuid = self._prov_active_uuid
+        self._prov_active_uuid = None
+
+        try:
+            if self._prov_timeout_src is not None:
+                GLib.source_remove(self._prov_timeout_src)
+        except Exception:
+            pass
+        self._prov_timeout_src = None
+
+        try:
+            if self._scan_active:
+                self.scan_stop()
+        except Exception:
+            pass
+        try:
+            if self.mgmt and hasattr(self.mgmt, "Cancel"):
+                self.mgmt.Cancel({})
+        except Exception:
+            pass
+
+        if uuid:
+            self.log(f"[Provision] canceled in-flight job for {uuid} ({reason})")
+
+
     def _persist_node_basic(self, uuid_hex: str, unicast: int, elements: int):
         """
         Make sure nodes.json has the basic info for this node.
@@ -750,7 +892,7 @@ class Controller:
                 "unicast": int(unicast),
                 "elements": int(elements),
                 "primary_elem": int(unicast),
-                "model_id": "0x1000",   # we're managing Generic OnOff Server
+                "model_id": "0x1000",
                 "app_idx": 0,
                 "provisioned_at": entry.get("provisioned_at", now_iso),
                 "last_seen": entry.get("last_seen", None),
@@ -765,8 +907,7 @@ class Controller:
 
     def _mark_node_stage(self, uuid_hex: str, stage: str, extra: Dict[str, Any] | None = None):
         """
-        Update node's 'state' field in nodes.json to reflect where we are
-        (appkey_ok, bind_ok, pub_ok, etc) and bump last_seen timestamp.
+        Update node's 'state' and bump last_seen.
         """
         try:
             db = load_nodes_db()
@@ -804,8 +945,7 @@ class Controller:
 
     def _fsm_send_pubset(self, unicast: int):
         """
-        Step 3 of provisioning FSM:
-        tell the node to periodically publish GenericOnOffStatus back to us.
+        Step 3 of provisioning FSM.
         """
         job = self._provision_jobs.get(unicast)
         if not job or not self.mgmt:
@@ -814,10 +954,7 @@ class Controller:
         elem_addr = job["elem_addr"]
         model_id  = job["model_id"]
         app_idx   = job["app_idx"]
-
-        # our own primary element is 0x0001, so tell the new node
-        # "publish your GenericOnOffStatus to 0x0001"
-        pub_addr    = 0x0001
+        pub_addr  = 0x0001
 
         ok_pub, msg_pub = self.cfg_pub_set_sig(
             dest_unicast=unicast,
@@ -826,7 +963,7 @@ class Controller:
             app_index=app_idx,
             model_id=model_id,
             ttl=7,
-            period=0x45,        # <-- IMPORTANT: nonzero, ~5s period
+            period=0x45,
             retransmit=0x00,
             cred_flag=False,
         )
@@ -862,30 +999,17 @@ class Controller:
             status = data[2] if len(data) > 2 else None
             return f"ModelPubStatus status=0x{status:02x}" if status is not None else "ModelPubStatus <short>"
 
+        # ---- NEW: 0x804A Node Reset Status
+        if op0 == 0x80 and op1 == 0x4A:
+            return "NodeResetStatus"
+
         return f"unknown opcode {data[0:2].hex()}"
 
     def _handle_config_status_from_node(self, src_unicast: int, data: bytes):
         """
         Advance the provisioning FSM based on config status PDUs from the node.
-
-        We care about three opcodes:
-
-        - 0x8003: Config AppKey Status
-            -> means the node accepted AppKey(0)
-            -> next step: Bind AppKey(0) to Generic OnOff Server (0x1000)
-
-        - 0x803E: Config Model App Status
-            -> means the Bind succeeded
-            -> next step: set Publication so it publishes GenericOnOffStatus to us
-
-        - 0x8019: Config Model Publication Status
-            -> means PubSet succeeded
-            -> provisioning DONE 🎉
-            -> ask node for its current GenericOnOff state immediately
         """
         job = self._provision_jobs.get(src_unicast)
-        if not job:
-            return  # not a node we're actively provisioning
 
         if len(data) < 2:
             return
@@ -894,76 +1018,127 @@ class Controller:
 
         # 0x8003 = Config AppKey Status
         if op0 == 0x80 and op1 == 0x03:
-            if len(data) >= 3:
+            if job and len(data) >= 3:
                 status = data[2]
                 if status == 0x00:
-                    # AppKey Add accepted
-                    self.log(
-                        f"[FSM] got AppKeyStatus OK from 0x{src_unicast:04x} -> send Bind next"
-                    )
+                    self.log(f"[FSM] got AppKeyStatus OK from 0x{src_unicast:04x} -> send Bind next")
                     job["stage"] = "appkey_ok"
-
-                    # reflect in nodes.json
                     self._mark_node_stage(job["uuid"], "appkey_ok")
-
-                    # kick off Bind
                     self._fsm_send_bind(src_unicast)
-                else:
-                    self.log(
-                        f"[FSM] AppKeyStatus FAIL (0x{status:02x}) from 0x{src_unicast:04x}"
-                    )
             return
 
-        # 0x803E = Config Model App Status (Bind result for SIG model)
+        # 0x803E = Config Model App Status (Bind)
         if op0 == 0x80 and op1 == 0x3E:
-            if len(data) >= 3:
+            if job and len(data) >= 3:
                 status = data[2]
                 if status == 0x00:
-                    self.log(
-                        f"[FSM] got Bind OK from 0x{src_unicast:04x} -> send PubSet next"
-                    )
+                    self.log(f"[FSM] got Bind OK from 0x{src_unicast:04x} -> send PubSet next")
                     job["stage"] = "bind_ok"
-
-                    # reflect in nodes.json
                     self._mark_node_stage(job["uuid"], "bind_ok")
-
-                    # tell node to publish GenericOnOffStatus to us
                     self._fsm_send_pubset(src_unicast)
-                else:
-                    self.log(
-                        f"[FSM] Bind FAIL (0x{status:02x}) from 0x{src_unicast:04x}"
-                    )
             return
 
-        # 0x8019 = Config Model Publication Status (PubSet result)
+        # 0x8019 = Config Model Publication Status (PubSet)
         if op0 == 0x80 and op1 == 0x19:
-            if len(data) >= 3:
+            if job and len(data) >= 3:
                 status = data[2]
                 if status == 0x00:
-                    self.log(
-                        f"[FSM] got PubSet OK from 0x{src_unicast:04x} -> provisioning DONE 🎉"
-                    )
+                    self.log(f"[FSM] got PubSet OK from 0x{src_unicast:04x} -> provisioning DONE 🎉")
                     job["stage"] = "done"
-
-                    # mark node fully active / publishing
                     self._mark_node_stage(job["uuid"], "pub_ok")
-
-                    # actively poll the node right now for its state,
-                    # so we don't have to sit around waiting for its periodic publish.
                     ok_get, msg_get = self.send_onoff_get(src_unicast, app_idx=0)
                     if ok_get:
-                        self.log(
-                            f"[FSM] sent GenericOnOffGet to 0x{src_unicast:04x}, waiting for Status…"
-                        )
+                        self.log(f"[FSM] sent GenericOnOffGet to 0x{src_unicast:04x}, waiting for Status…")
                     else:
-                        self.log(
-                            f"[FSM] failed to send GenericOnOffGet to 0x{src_unicast:04x}: {msg_get}"
-                        )
-                else:
-                    self.log(
-                        f"[FSM] PubSet FAIL (0x{status:02x}) from 0x{src_unicast:04x}"
-                    )
+                        self.log(f"[FSM] failed to send GenericOnOffGet to 0x{src_unicast:04x}: {msg_get}")
             return
+
+        # ---- NEW: 0x804A = Node Reset Status (ack for 0x8049)
+        if op0 == 0x80 and op1 == 0x4A:
+            self.log(f"[Reset] Node 0x{src_unicast:04x} acknowledged reset (0x804A). Marking reset_ok.")
+            try:
+                db = load_nodes_db()
+                now_iso = datetime.now(timezone.utc).isoformat()
+                for uuid_hex, entry in list(db.items()):
+                    if int(entry.get("unicast", -1)) == src_unicast:
+                        entry["state"] = "reset_ok"
+                        entry["last_seen"] = now_iso
+                        # optional: clear last_onoff after reset
+                        entry.pop("last_onoff", None)
+                        db[uuid_hex] = entry
+                        break
+                save_nodes_db(db)
+            except Exception as e:
+                self.log(f"[Reset] failed to update nodes.json: {e}")
+
+            # clean up any pending FSM job for this node
+            try:
+                self._provision_jobs.pop(src_unicast, None)
+            except Exception:
+                pass
+            return
+
+    def _db_state_for_uuid(self, uuid_hex: str) -> Optional[str]:
+        try:
+            db = load_nodes_db()
+            s = db.get(uuid_hex, {}).get("state")
+            if isinstance(s, dict):
+                s = s.get("value") or s.get("name") or s.get("state") or s.get("status")
+            return (str(s).strip().lower() if s else None)
+        except Exception:
+            return None
+
+    def _db_is_final_pub_ok(self, uuid_hex: str) -> bool:
+        return (self._db_state_for_uuid(uuid_hex) in ("pub_ok", "done"))
+
+    def _provisioning_busy(self) -> bool:
+        return self._prov_active_uuid is not None
+
+    def _provisioning_begin(self, uuid_hex: str, timeout_sec: int = 0):
+        # kept for compatibility with callers; we just set the active UUID now
+        self._prov_active_uuid = uuid_hex
+        # no timers in no-timeout mode
+        try:
+            if self._prov_timeout_src is not None:
+                GLib.source_remove(self._prov_timeout_src)
+        except Exception:
+            pass
+        self._prov_timeout_src = None
+
+    def _provisioning_end_if(self, uuid_hex: str):
+        if self._prov_active_uuid == uuid_hex:
+            self._prov_active_uuid = None
+        try:
+            if self._prov_timeout_src is not None:
+                GLib.source_remove(self._prov_timeout_src)
+        except Exception:
+            pass
+        self._prov_timeout_src = None
+
+
+    def _provisioning_start_next_if_any(self):
+        if self._prov_active_uuid is None and self._prov_queue:
+            nxt = self._prov_queue.pop(0)
+            self.log(f"[Provision] starting queued UUID {nxt}")
+            # go through public path for the same checks
+            try:
+                self.provision_uuid(nxt)
+            except Exception as e:
+                self.log(f"[Provision] failed to start queued {nxt}: {e}")
+                # try the next one if this entry was bad
+                self._provisioning_start_next_if_any()
+
+    def _resume_scan_if_needed(self):
+        # resume only if we paused it for provisioning
+        if self._scan_should_resume:
+            self._scan_should_resume = False
+            try:
+                ok, msg = self.scan_start()
+                if not ok:
+                    self.log(f"[Scan] resume failed: {msg}")
+            except Exception as e:
+                self.log(f"[Scan] resume exception: {e}")
+
 
     # ---------------- callbacks from bluetooth-meshd ----------------
 
@@ -1013,68 +1188,87 @@ class Controller:
         self.log(f"Alloc unicast: 0x{start:04x}..+{count-1}")
         return start
 
+    # ---------------- callbacks from bluetooth-meshd ----------------
+
     def on_add_node_complete(self, uuid_bytes: bytes, unicast: int, count: int):
         """
-        bluetooth-meshd Provisioner1.AddNodeComplete callback.
-        Node has just been provisioned via PB-ADV.
-        We'll:
-          - stash FSM job
-          - save nodes.json state='provisioning'
-          - create (or confirm) AppKey(0)
-          - send Config AppKey Add to the node
+        Provisioner1.AddNodeComplete callback.
+        - Clears single-flight busy flag.
+        - Does NOT auto-restart scanning.
         """
-        uuid_hex = uuid_bytes.hex()
-        self.log(
-            f"AddNodeComplete: uuid={uuid_hex} "
-            f"unicast=0x{unicast:04x} elements={count}"
-        )
+        if not self._rx_enabled:
+            self.log("[FSM] ignoring AddNodeComplete while locally detached")
+            return
 
-        # create/refresh FSM job
+        uuid_hex = uuid_bytes.hex()
+        self.log(f"AddNodeComplete: uuid={uuid_hex} unicast=0x{unicast:04x} elements={count}")
+
+        # Clear busy flag if this was our in-flight UUID.
+        if self._prov_active_uuid == uuid_hex:
+            self._prov_active_uuid = None
+
+        # Create/refresh FSM job
         self._provision_jobs[unicast] = {
             "uuid": uuid_hex,
             "stage": "provisioning",
-            "model_id": 0x1000,    # Generic OnOff Server
-            "app_idx": 0,          # AppKey(0)
-            "elem_addr": unicast,  # element 0
+            "model_id": 0x1000,   # Generic OnOff Server
+            "app_idx": 0,         # AppKey(0)
+            "elem_addr": unicast, # element 0
         }
 
-        # make/update nodes.json
+        # Persist basics
         self._persist_node_basic(uuid_hex, unicast, count)
 
+        # Kick off config steps (AppKey Add) in a thread
         def _kickoff_cfg():
-            # Ensure we have AppKey(0) locally
             self._ensure_appkey(app_index=0, net_index=0)
-
-            # Push that AppKey down to the node (Config AppKey Add)
-            ok, msg = self.add_appkey_to_node(
-                unicast,
-                app_index=0,
-                net_index=0,
-                update=False
-            )
+            ok, msg = self.add_appkey_to_node(unicast, app_index=0, net_index=0, update=False)
             if ok:
                 self.log(f"[FSM] AppKey Add sent to 0x{unicast:04x}")
                 self._provision_jobs[unicast]["stage"] = "appkey_sent"
-                # After this, we expect a DevKey message:
-                #   opcode 0x8003 (AppKey Status)
-                # which will trigger _fsm_send_bind.
             else:
                 self.log(f"[FSM] AppKey Add FAILED to 0x{unicast:04x}: {msg}")
+
+        # Best-effort: ensure scanning is stopped (may already be)
         try:
-            self.log("[FSM] stopping scan (UnprovisionedScanCancel)")
-            self.mgmt.UnprovisionedScanCancel()
+            if self._scan_active:
+                self.mgmt.UnprovisionedScanCancel()
+                self._scan_active = False
+                self.log("[FSM] ensured scan stopped after AddNodeComplete")
         except Exception as e:
-            self.log(f"[FSM] scan-cancel failed (non-fatal): {e}")
+            self.log(f"[FSM] scan-cancel post-complete non-fatal: {e}")
+
         threading.Thread(target=_kickoff_cfg, daemon=True).start()
 
+
     def on_add_node_failed(self, uuid_bytes: bytes, reason: str):
-        self.log(f"AddNodeFailed: uuid={uuid_bytes.hex()} reason={reason}")
+        """
+        Provisioner1.AddNodeFailed callback.
+        - Clears single-flight busy flag.
+        - Does NOT auto-restart scanning.
+        """
+        if not self._rx_enabled:
+            self.log("[FSM] ignoring AddNodeFailed while locally detached")
+            return
+
+        uuid_hex = uuid_bytes.hex()
+        self.log(f"AddNodeFailed: uuid={uuid_hex} reason={reason}")
+
+        if self._prov_active_uuid == uuid_hex:
+            self._prov_active_uuid = None
+
+        # Leave scan state unchanged — UI decides whether to scan again.
+
 
     def on_element_message(self, source: int, key_index: int, destination, data: bytes):
         """
         Element1.MessageReceived: application-layer (AppKey-encrypted) msg.
         We'll specifically interpret GenericOnOffStatus (0x82 0x04).
         """
+        # ---- NEW: gate messages while "detached" locally ----
+        if not self._rx_enabled:
+            return
+
         try:
             info = "unknown"
             last_onoff_val = None
@@ -1112,8 +1306,12 @@ class Controller:
     def on_element_devkey_message(self, source: int, remote: bool, net_index: int, data: bytes):
         """
         Element1.DevKeyMessageReceived: config/status messages encrypted with DevKey.
-        This is where nodes answer AppKey Add / Bind / PubSet.
+        This is where nodes answer AppKey Add / Bind / PubSet / Reset.
         """
+        # ---- NEW: gate messages while "detached" locally ----
+        if not self._rx_enabled:
+            return
+
         try:
             decoded = self._decode_config_status(data)
             line = (
@@ -1125,7 +1323,7 @@ class Controller:
         except Exception as e:
             self.log(f"[Element0] DevKeyMessageReceived error: {e}")
 
-        # drive the provisioning FSM forward
+        # drive the provisioning FSM forward (+ reset ack)
         try:
             self._handle_config_status_from_node(source, data)
         except Exception as e:
@@ -1135,27 +1333,21 @@ class Controller:
         """
         Ask a node for its Generic OnOff state (Generic OnOff Get, opcode 0x8201).
         We send this over AppKey 'app_idx' (we always use 0 so far).
-
-        That node should answer with GenericOnOffStatus (opcode 0x8204),
-        which will arrive via on_element_message(), which writes mesh_app.log
-        and updates nodes.json last_onoff/last_seen.
         """
         if not self.is_attached:
             raise RuntimeError("Not attached yet")
 
-        # Generic OnOff Get opcode = 0x82 0x01 (2-byte SIG opcode)
         payload = bytes([0x82, 0x01])
 
         self.log(f"[debug] sending GenericOnOff Get -> 0x{dest_unicast:04x}")
 
-        # FIXED: Use Element0 proxy + explicit path
         try:
             return self._safe_call(
                 lambda: self.mgmt.Send(
-                    ELEM0_PATH,  # Our app's Element0 path
+                    ELEM0_PATH,
                     int(dest_unicast),
                     int(app_idx),
-                    {},           # options dict: we'll keep empty for now
+                    {},
                     payload,
                 ),
                 f"OnOffGet(0x{dest_unicast:04x})"
@@ -1165,14 +1357,11 @@ class Controller:
             return False, f"OnOffGet proxy failed: {e}"
 
     # ---------------- utilities ----------------
-
+        
     def _safe_call(self, fn, label: str):
-        """
-        Wrap any D-Bus call in try/except and return (ok, msg)
-        so the GUI doesn't explode.
-        """
         try:
-            fn()
+            with self._dbus_lock:
+                fn()
             return True, f"{label}: OK"
         except Exception as e:
             emsg = e.args[0] if e.args else str(e)

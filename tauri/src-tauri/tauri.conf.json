@@ -1,0 +1,62 @@
+{
+  "productName": "Vespulaa",
+  "version": "0.1.0",
+  "identifier": "org.vespulaa.app",
+
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "frontendDist": "../src"
+  },
+
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Vespulaa Mesh",
+        "url": "index.html",
+        "width": 1200,
+        "height": 800,
+        "resizable": true
+      }
+    ]
+  },
+
+  "bundle": {
+    "active": true,
+    "targets": ["deb"],
+    "resources":[
+      "resources/vesp/**/*"
+    ],
+    "linux": {
+      "deb": {
+        "depends": [
+          "python3",
+          "python3-gi",
+          "python3-pydbus",
+          "dbus",
+          "systemd",
+          "policykit-1",
+          "libwebkit2gtk-4.1-0",
+          "libayatana-appindicator3-1",
+          "librsvg2-2",
+          "libgtk-3-0t64",
+          "libsoup-3.0-0",
+          "libssl3",
+          "libgdk-pixbuf-2.0-0",
+          "libcairo2",
+          "libpango-1.0-0",
+          "libharfbuzz0b",
+          
+          "gsettings-desktop-schemas",
+          "glib-networking",
+          "ca-certificates",
+          "at-spi2-core",
+          "shared-mime-info",
+          "hicolor-icon-theme"
+        ]
+      }
+    }
+  }
+}
+
